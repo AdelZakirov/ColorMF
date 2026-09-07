@@ -1,0 +1,15 @@
+# Python 3.13-compatible runtime dependencies.
+# Install a CUDA-enabled PyTorch build appropriate for the host when the
+# package index does not select one automatically.
+pip>=24.2
+setuptools>=75.0
+wheel>=0.44
+torch>=2.5.0
+torchvision>=0.20.0
+pytorch-lightning>=2.4.0,<3.0
+torchmetrics>=1.4.0
+numpy>=2.0.0
+opencv-python-headless>=4.10.0
+Pillow>=10.0.0
+PyYAML>=6.0.0
+pytest>=8.0.0

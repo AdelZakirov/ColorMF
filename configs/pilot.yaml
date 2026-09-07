@@ -1,0 +1,44 @@
+seed: 1234
+
+model:
+  resolution: [256, 256]
+  patch_size: 16
+  hidden_size: 384
+  depth: 12
+  heads: 8
+  mlp_ratio: 4.0
+
+data:
+  # Prefer manifests for very large datasets. Each line is either:
+  #   /absolute/or/relative/path.jpg
+  # or:
+  #   stable-image-id<TAB>/absolute/or/relative/path.jpg
+  train_manifest: /mnt/IMAGING/HUB/DATASETS/general_datasets/animals/animals.txt
+  val_manifest: null
+  train_root: null
+  val_root: /mnt/IMAGING/HUB/DATASETS/general_datasets/imagenet/custom_val
+  resolution: [256, 256]
+  batch_size: 8
+  val_batch_size: 4
+  num_workers: 4
+  horizontal_flip: true
+
+training:
+  accelerator: auto
+  devices: 1
+  precision: bf16-mixed
+  max_epochs: 100
+  max_steps: null
+  accumulate_grad_batches: 1
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  warmup_steps: 1000
+  auxiliary_weight: 1.0
+  gradient_clip_val: 1.0
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  sample_dir: qualitative
+  sync_batchnorm: false
+
+validation:
+  image_ids: []
