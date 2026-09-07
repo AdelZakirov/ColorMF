@@ -32,7 +32,8 @@ class Muon(Optimizer):
     """Optax-compatible partitioned Muon.
 
     As in ``optax.contrib.muon``, exactly 2-D parameters use Nesterov Muon;
-    biases, norm scales, token tensors, and convolution kernels use AdamW.
+    biases, norm scales, token tensors, and convolution kernels use
+    Nesterov-AdamW.
     PyTorch stores linear kernels transposed relative to Flax, so width scaling
     is computed from ``(fan_in=shape[1], fan_out=shape[0])``.
     """
@@ -40,9 +41,12 @@ class Muon(Optimizer):
     def __init__(self, params, lr: float = 1e-3, beta: float = 0.95,
                  adam_b1: float = 0.9, adam_b2: float = 0.95,
                  eps: float = 1e-8, weight_decay: float = 0.0,
+                 adam_weight_decay: float = 0.0, nesterov: bool = True,
                  ns_steps: int = 5):
         defaults = dict(lr=lr, beta=beta, adam_b1=adam_b1, adam_b2=adam_b2,
-                        eps=eps, weight_decay=weight_decay, ns_steps=ns_steps)
+                        eps=eps, weight_decay=weight_decay,
+                        adam_weight_decay=adam_weight_decay,
+                        nesterov=nesterov, ns_steps=ns_steps)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -67,8 +71,11 @@ class Muon(Optimizer):
                     beta = group["beta"]
                     momentum.mul_(beta).add_(gradient, alpha=1 - beta)
                     # Matches Optax's bias-corrected Nesterov form.
-                    update = beta * momentum / (1 - beta ** (step + 1))
-                    update = update + (1 - beta) * gradient / (1 - beta ** step)
+                    if group["nesterov"]:
+                        update = beta * momentum / (1 - beta ** (step + 1))
+                        update = update + (1 - beta) * gradient / (1 - beta ** step)
+                    else:
+                        update = momentum / (1 - beta ** step)
                     update = _newton_schulz(update, group["ns_steps"], eps=group["eps"])
                     fan_out, fan_in = parameter.shape
                     update.mul_(math.sqrt(max(1.0, fan_out / fan_in)))
@@ -81,9 +88,14 @@ class Muon(Optimizer):
                     second = state.setdefault("exp_avg_sq", torch.zeros_like(parameter))
                     first.mul_(b1).add_(gradient, alpha=1 - b1)
                     second.mul_(b2).addcmul_(gradient, gradient, value=1 - b2)
-                    denominator = second.sqrt().div_(math.sqrt(1 - b2 ** step)).add_(eps)
-                    step_size = lr / (1 - b1 ** step)
-                    if group["weight_decay"]:
-                        parameter.mul_(1 - lr * group["weight_decay"])
-                    parameter.addcdiv_(first, denominator, value=-step_size)
+                    if group["nesterov"]:
+                        first_hat = b1 * first / (1 - b1 ** (step + 1))
+                        first_hat = first_hat + (1 - b1) * gradient / (1 - b1 ** step)
+                    else:
+                        first_hat = first / (1 - b1 ** step)
+                    second_hat = second / (1 - b2 ** step)
+                    denominator = second_hat.sqrt().add_(eps)
+                    if group["adam_weight_decay"]:
+                        parameter.mul_(1 - lr * group["adam_weight_decay"])
+                    parameter.addcdiv_(first_hat, denominator, value=-lr)
         return loss

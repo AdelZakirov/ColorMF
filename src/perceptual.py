@@ -120,10 +120,10 @@ class PerceptualLosses:
         if self.convnext is None:
             convnext_values = zeros
         else:
-            mean = predicted_rgb.new_tensor([0.485, 0.456, 0.406])[None, :, None, None]
-            std = predicted_rgb.new_tensor([0.229, 0.224, 0.225])[None, :, None, None]
-            predicted_input = (predicted_rgb - mean) / std
-            target_input = (target_rgb - mean) / std
+            # Faithful pMF behavior: its normalized training images are sent
+            # directly to the converted ConvNeXt feature extractor.
+            predicted_input = predicted_rgb * 2 - 1
+            target_input = target_rgb * 2 - 1
             predicted_output = self.convnext(pixel_values=predicted_input)
             target_output = self.convnext(pixel_values=target_input)
             predicted_features = getattr(predicted_output, "pooler_output", predicted_output)

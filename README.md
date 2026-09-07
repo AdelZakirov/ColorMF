@@ -19,6 +19,8 @@ cross-attention, or ControlNet-style paths.
 - JAX training/objective: `Lyy-iiis/pMF@75f6073042c21f7104686261a0c4784db4ede9d1`
 - PyTorch architecture: `Lyy-iiis/pMF@990e81a84249dbd68a128accef67eb95621d10b1`
 - ColorMF starting point: `513626c5a0c61b8e89214ab3f5daed35f49fec18`
+- Optax Muon/NAdam reference immediately preceding the pMF commit:
+  `google-deepmind/optax@e3a96e9487d1a9c670b67395f02603439e52905b`
 
 The model port preserves `BottleneckPatchEmbedder`, scaled-variance
 `TorchLinear`, RMSNorm, QK RMSNorm, spatial-only 2-D RoPE, SwiGLU, learned
@@ -80,7 +82,8 @@ and converted by Kornia 0.8.3 `lab_to_rgb(..., clip=False)`. Inspection of
 that version confirms this disables its final RGB `[0,1]` clamp (Kornia still
 applies the standard internal non-negative `fz` guard during LAB-to-XYZ).
 LPIPS receives
-`2*RGB-1`; ConvNeXt receives ImageNet-normalized RGB. No clamp is applied to
+`2*RGB-1`; matching official pMF, ConvNeXt receives that same `[-1,1]` tensor
+directly without an additional ImageNet mean/std transform. No clamp is applied to
 generated chroma or to Kornia RGB before the frozen loss networks.
 
 Sampling is exactly one NFE. For `z_1 ~ N(0,I)`, `t=1`, `r=0`, the network
@@ -104,7 +107,8 @@ Validation and `sample.py --ema-variant {500,1000,2000}` can select any shadow;
 
 `src/optimizer.py` ports `optax.contrib.muon`: 2-D matrices use bias-corrected
 Nesterov momentum, five-step Frobenius-preconditioned Newton-Schulz
-orthogonalization, and Optax width scaling. Non-2-D tensors use AdamW, matching
+orthogonalization, and Optax width scaling. Non-2-D tensors use
+Nesterov-AdamW, matching
 Optax's default parameter partition. The unavoidable framework difference is
 PyTorch's transposed linear-kernel storage; width scaling explicitly maps its
 shape back to `(fan_in, fan_out)`. AdamW remains an explicit legacy option.
@@ -149,8 +153,8 @@ MLflow, qualitative grids, and checkpoint resume.
 2. FFHQ replaces ImageNet and uses the established ColorMF LAB normalization.
 3. 64/4 and 128/8 are documented resolution adaptations, not published presets.
 4. Perceptual RGB is obtained through differentiable Kornia LAB conversion;
-   ConvNeXt input is explicitly ImageNet-normalized. The official JAX utility
-   passes its already-normalized training tensor directly.
+   after mapping to `[-1,1]`, LPIPS and ConvNeXt preprocessing follows the
+   official auxiliary-loss behavior.
 5. The optimizer and distributed runtime are PyTorch/Lightning ports. Muon
    follows Optax math, but kernels and distributed execution use PyTorch layouts.
 

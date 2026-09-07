@@ -8,9 +8,30 @@ from typing import Optional, Sequence, Tuple
 
 import cv2
 import pytorch_lightning as pl
+import numpy as np
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from .lab import rgb_to_lab
+
+
+def adm_center_crop(image: np.ndarray, image_size: int) -> np.ndarray:
+    """Literal NumPy/Pillow port of official pMF's ADM center_crop_arr."""
+    pil_image = Image.fromarray(image)
+    while min(pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(
+            tuple(value // 2 for value in pil_image.size),
+            resample=Image.Resampling.BOX,
+        )
+    scale = image_size / min(pil_image.size)
+    pil_image = pil_image.resize(
+        tuple(round(value * scale) for value in pil_image.size),
+        resample=Image.Resampling.BICUBIC,
+    )
+    resized = np.asarray(pil_image)
+    top = (resized.shape[0] - image_size) // 2
+    left = (resized.shape[1] - image_size) // 2
+    return resized[top : top + image_size, left : left + image_size]
 
 
 class IndexedManifest:
@@ -96,16 +117,9 @@ class PaletteDataset(Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         target_height, target_width = self.size
         if self.resize_strategy == "center_crop":
-            # Official pMF uses ADM-style aspect-preserving resize + center crop.
-            scale = max(target_height / image.shape[0], target_width / image.shape[1])
-            resized = cv2.resize(
-                image,
-                (round(image.shape[1] * scale), round(image.shape[0] * scale)),
-                interpolation=cv2.INTER_CUBIC,
-            )
-            top = (resized.shape[0] - target_height) // 2
-            left = (resized.shape[1] - target_width) // 2
-            image = resized[top : top + target_height, left : left + target_width]
+            if target_height != target_width:
+                raise ValueError("official ADM center crop requires a square target")
+            image = adm_center_crop(image, target_height)
         elif self.resize_strategy == "stretch":
             image = cv2.resize(
                 image, (target_width, target_height), interpolation=cv2.INTER_CUBIC

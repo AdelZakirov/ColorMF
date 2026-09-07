@@ -12,8 +12,10 @@ class IdentityFeatures(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.ones(()))
+        self.last_input = None
 
     def forward(self, pixel_values):
+        self.last_input = pixel_values.detach().clone()
         return self.scale * pixel_values.mean((2, 3))
 
 
@@ -44,3 +46,18 @@ def test_loss_networks_are_frozen():
                      lpips_network=lpips, convnext_network=convnext)
     assert all(not parameter.requires_grad
                for network in (lpips, convnext) for parameter in network.parameters())
+
+
+def test_convnext_receives_official_minus_one_to_one_range_without_mean_std():
+    convnext = IdentityFeatures()
+    losses = PerceptualLosses(use_lpips=False, use_convnext=True,
+                              convnext_network=convnext)
+    L = torch.zeros(1, 1, 32, 32)
+    ab = torch.zeros(1, 2, 32, 32)
+    expected = normalized_lab_to_rgb(L, ab) * 2 - 1
+    losses(ab, ab, L)
+    assert convnext.last_input is not None
+    # Constant images are invariant under the paired random resized crop.
+    expected_pixel = expected[:, :, :1, :1].expand_as(convnext.last_input)
+    torch.testing.assert_close(convnext.last_input, expected_pixel,
+                               atol=2e-5, rtol=1e-5)

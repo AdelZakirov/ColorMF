@@ -17,3 +17,6 @@ Pillow>=10.0.0
 PyYAML>=6.0.0
 mlflow>=3.16.0
 pytest>=8.0.0
+# Reference-only dependencies for the direct Optax Muon parity test.
+jax>=0.4.34
+optax>=0.2.5
