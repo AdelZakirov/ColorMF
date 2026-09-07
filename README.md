@@ -136,8 +136,8 @@ target environment. Then configure manifests or roots in
 `configs/pilot.yaml`:
 
 ```bash
-python train.py --config configs/pilot.yaml
-python sample.py --config configs/pilot.yaml \
+./.venv/bin/python train.py --config configs/pilot.yaml
+./.venv/bin/python sample.py --config configs/pilot.yaml \
   --checkpoint checkpoints/last.ckpt \
   --input input.jpg --output colorized.png --seed 42
 ```
@@ -155,6 +155,22 @@ Conservative AdamW, warmup, clipping, and BF16 settings in the pilot config
 are experiment settings, not pMF requirements. Mathematical tests are FP32;
 the objective explicitly casts adaptive loss reductions to FP32 under BF16
 autocast.
+
+The pilot logs locally with MLflow in the SQLite database `./mlflow.db`. Start
+the tracking UI in a second terminal with:
+
+```bash
+./.venv/bin/mlflow ui --backend-store-uri sqlite:///./mlflow.db \
+  --default-artifact-root ./mlartifacts --host 127.0.0.1 --port 5000
+```
+
+Open `http://127.0.0.1:5000` to inspect the `tmp` experiment. The run records
+the flattened training configuration as parameters, all Lightning training
+and validation metrics, and qualitative validation grids as artifacts under
+`./mlartifacts`.
+Checkpoints remain in `training.checkpoint_dir` and are not duplicated into
+MLflow by default. To use the shared server instead, change
+`training.logger.tracking_uri` to its HTTPS URL.
 
 ## Validation status in this checkout
 

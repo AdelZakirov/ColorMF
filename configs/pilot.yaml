@@ -44,6 +44,13 @@ training:
   gradient_clip_val: 1.0
   checkpoint_dir: checkpoints
   log_dir: logs
+  logger:
+    type: mlflow
+    tracking_uri: sqlite:///./mlflow.db
+    artifact_location: file:./mlartifacts
+    experiment_name: tmp
+    run_name: color-mf-pilot
+    log_model: false
   sample_dir: qualitative
   sync_batchnorm: false
 

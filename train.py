@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import json
+import platform
+import subprocess
+import sys
+from pathlib import Path
 
+import mlflow
 import pytorch_lightning as pl
+import torch
 import yaml
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.loggers import CSVLogger, MLFlowLogger
 
 from src.data import PaletteDataModule
 from src.lightning_module import PMFColorizerModule
@@ -18,6 +25,88 @@ def parse_args():
     parser.add_argument("--config", default="configs/pilot.yaml")
     parser.add_argument("--resume", default=None)
     return parser.parse_args()
+
+
+def build_logger(config: dict):
+    logger_config = config.get("logger", {})
+    logger_type = logger_config.get("type", "csv").lower()
+    if logger_type == "mlflow":
+        return MLFlowLogger(
+            experiment_name=logger_config.get("experiment_name", "tmp"),
+            run_name=logger_config.get("run_name"),
+            tracking_uri=logger_config.get(
+                "tracking_uri", "sqlite:///./mlflow.db"
+            ),
+            log_model=logger_config.get("log_model", False),
+            artifact_location=logger_config.get(
+                "artifact_location", "file:./mlartifacts"
+            ),
+            save_dir=training_log_dir(config),
+        )
+    if logger_type == "csv":
+        return CSVLogger(training_log_dir(config))
+    raise ValueError(f"unsupported logger type: {logger_type}")
+
+
+def training_log_dir(config: dict) -> str:
+    return config.get("log_dir", "logs")
+
+
+def _git_value(*arguments: str, fallback: str = "unknown") -> str:
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=Path(__file__).resolve().parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return fallback
+    return result.stdout.strip() or fallback
+
+
+def _tag_value(value) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def log_mlflow_metadata(logger, config: dict, module: PMFColorizerModule) -> None:
+    if not isinstance(logger, MLFlowLogger):
+        return
+    data = config.get("data", {})
+    training = config.get("training", {})
+    tags = {
+        "runtime/mlflow_version": mlflow.__version__,
+        "runtime/python_version": sys.version.split()[0],
+        "runtime/pytorch_version": torch.__version__,
+        "runtime/lightning_version": pl.__version__,
+        "runtime/hostname": platform.node(),
+        "source/git_commit": _git_value("rev-parse", "HEAD"),
+        "source/git_dirty": bool(
+            _git_value("status", "--porcelain", fallback="")
+        ),
+        "model/parameter_report": module.model.parameter_report(),
+        "data/train_manifest": data.get("train_manifest"),
+        "data/val_manifest": data.get("val_manifest"),
+        "data/resolution": data.get("resolution"),
+        "data/batch_size": data.get("batch_size"),
+        "data/val_batch_size": data.get("val_batch_size"),
+        "training/accelerator": training.get("accelerator"),
+        "training/devices": training.get("devices"),
+        "training/precision": training.get("precision"),
+        "training/max_epochs": training.get("max_epochs"),
+        "training/max_steps": training.get("max_steps"),
+        "training/accumulate_grad_batches": training.get(
+            "accumulate_grad_batches"
+        ),
+        "sampling/time_sampling": training.get("time_sampling", {}),
+    }
+    for key, value in tags.items():
+        logger.experiment.set_tag(logger.run_id, key, _tag_value(value))
 
 
 def main():
@@ -70,10 +159,14 @@ def main():
         accumulate_grad_batches=training.get("accumulate_grad_batches", 1),
         gradient_clip_val=training["gradient_clip_val"],
         callbacks=[checkpoint],
-        logger=CSVLogger(training.get("log_dir", "logs")),
+        logger=build_logger(training),
         sync_batchnorm=training.get("sync_batchnorm", False),
         use_distributed_sampler=True,
     )
+    if trainer.logger is not None:
+        trainer.logger.log_hyperparams(config)
+        if trainer.is_global_zero:
+            log_mlflow_metadata(trainer.logger, config, module)
     trainer.fit(module, datamodule=datamodule, ckpt_path=args.resume)
 
 

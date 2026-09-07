@@ -10,6 +10,7 @@ from typing import Dict, Iterable, Optional
 import numpy as np
 import pytorch_lightning as pl
 import torch
+from pytorch_lightning.loggers import MLFlowLogger
 
 from PIL import Image, ImageDraw
 
@@ -312,14 +313,26 @@ class PMFColorizerModule(pl.LightningModule):
             generated = self.model.sample(
                 L.to(device), seeds=seeds, image_ids=[image_id]
             ).cpu()
+            filename = str(
+                output_dir / f"epoch-{self.current_epoch:04d}-{image_id}.png"
+            )
             _save_qualitative_row(
-                str(output_dir / f"epoch-{self.current_epoch:04d}-{image_id}.png"),
+                filename,
                 L,
                 gt,
                 generated,
             )
+            self._log_mlflow_artifact(filename)
         self._validation_visuals.clear()
         self._validation_metrics.clear()
+
+    def _log_mlflow_artifact(self, filename: str) -> None:
+        for logger in getattr(self.trainer, "loggers", []):
+            if not isinstance(logger, MLFlowLogger):
+                continue
+            logger.experiment.log_artifact(
+                logger.run_id, filename, artifact_path="qualitative"
+            )
 
     def on_save_checkpoint(self, checkpoint: dict):
         if self._train_generator is not None:
