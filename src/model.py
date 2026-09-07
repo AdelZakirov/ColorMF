@@ -14,6 +14,39 @@ from .lab import compose_lab
 from .pmf import average_velocity
 
 
+def _sincos_positions(length: int, dimension: int) -> Tensor:
+    positions = torch.arange(length, dtype=torch.float32).reshape(-1, 1)
+    half = dimension // 2
+    if half == 0:
+        return torch.zeros(length, dimension)
+    frequencies = torch.exp(
+        -math.log(10_000.0)
+        * torch.arange(half, dtype=torch.float32)
+        / max(half, 1)
+    )
+    angles = positions * frequencies.reshape(1, -1)
+    embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)
+    if embedding.shape[-1] < dimension:
+        embedding = F.pad(embedding, (0, dimension - embedding.shape[-1]))
+    return embedding
+
+
+def _two_dimensional_position_embedding(
+    rows: int, columns: int, dimension: int
+) -> Tensor:
+    row_dimension = dimension // 2
+    column_dimension = dimension - row_dimension
+    row_embedding = _sincos_positions(rows, row_dimension)[:, None, :].expand(
+        rows, columns, row_dimension
+    )
+    column_embedding = _sincos_positions(columns, column_dimension)[None, :, :].expand(
+        rows, columns, column_dimension
+    )
+    return torch.cat([row_embedding, column_embedding], dim=-1).reshape(
+        1, rows * columns, dimension
+    )
+
+
 class ScalarFourierEmbedding(nn.Module):
     def __init__(self, dim: int, max_period: int = 10_000):
         super().__init__()
@@ -154,6 +187,13 @@ class PMFTiny(nn.Module):
         self.patch_area = patch_size * patch_size
 
         self.patch_embed = PatchEmbed(in_channels, hidden_size, patch_size)
+        self.register_buffer(
+            "position_embedding",
+            _two_dimensional_position_embedding(
+                self.patch_rows, self.patch_cols, hidden_size
+            ),
+            persistent=False,
+        )
         self.time_condition = TimeCondition(hidden_size)
         self.blocks = nn.ModuleList(
             [TransformerBlock(hidden_size, heads, mlp_ratio) for _ in range(depth)]
@@ -203,6 +243,9 @@ class PMFTiny(nn.Module):
         if z.shape[-2:] != self.resolution or L.shape[-2:] != self.resolution:
             raise ValueError(f"expected spatial resolution {self.resolution}")
         hidden = self.patch_embed(torch.cat([z, L], dim=1))
+        hidden = hidden + self.position_embedding.to(
+            device=hidden.device, dtype=hidden.dtype
+        )
         condition = self.time_condition(r, t)
         for block in self.blocks:
             hidden = block(hidden, condition)
@@ -251,7 +294,8 @@ class PMFTiny(nn.Module):
 
         With a single input image, a sequence of seeds returns one sample per
         seed.  Per-example noise is generated independently on CPU so changing
-        batch size or DDP rank does not change a sample's random stream.
+        batch size or DDP rank does not change a sample's random stream. Network
+        arithmetic may still vary slightly with CUDA batching and precision.
         """
 
         if seed is None and seeds is None:

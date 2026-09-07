@@ -38,12 +38,13 @@ def main():
     if image is None:
         raise FileNotFoundError(args.input)
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    L, _ = rgb_to_lab(image)
-    size = tuple(config["model"].get("resolution", (256, 256)))
-    if L.shape[-2:] != size:
-        L = torch.nn.functional.interpolate(
-            L.unsqueeze(0), size=size, mode="bilinear", align_corners=False
+    size = module.model.resolution
+    if image.shape[:2] != size:
+        image = cv2.resize(
+            image, (size[1], size[0]), interpolation=cv2.INTER_CUBIC
         )
+    L, _ = rgb_to_lab(image)
+    L = L.unsqueeze(0)
     generated = module.model.sample(L, seed=args.seed)
     rgb = lab_to_rgb(L, generated)[0]
     cv2.imwrite(args.output, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))

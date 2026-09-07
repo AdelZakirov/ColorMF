@@ -34,6 +34,13 @@ training:
   weight_decay: 0.0001
   warmup_steps: 1000
   auxiliary_weight: 1.0
+  time_sampling:
+    # Official pMF 256px B/16 logit-normal preset.
+    p_mean: 0.8
+    p_std: 0.8
+    data_proportion: 0.5
+    tr_uniform: false
+    uniform_probability: 0.1
   gradient_clip_val: 1.0
   checkpoint_dir: checkpoints
   log_dir: logs

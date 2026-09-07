@@ -51,6 +51,12 @@ class PMFColorizerModule(pl.LightningModule):
         warmup_steps: int = 1_000,
         max_steps: Optional[int] = None,
         auxiliary_weight: float = 1.0,
+        time_p_mean: float = 0.8,
+        time_p_std: float = 0.8,
+        time_data_proportion: float = 0.5,
+        time_tr_uniform: bool = False,
+        time_uniform_probability: float = 0.1,
+        random_seed: int = 1234,
         fixed_validation_ids: Optional[Iterable[str]] = None,
         sample_dir: str = "qualitative",
     ):
@@ -63,9 +69,20 @@ class PMFColorizerModule(pl.LightningModule):
         self.max_steps = max_steps
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.time_p_mean = time_p_mean
+        self.time_p_std = time_p_std
+        self.time_data_proportion = time_data_proportion
+        self.time_tr_uniform = time_tr_uniform
+        self.time_uniform_probability = time_uniform_probability
+        self.random_seed = random_seed
         self.fixed_validation_ids = set(fixed_validation_ids or [])
         self.sample_dir = sample_dir
         self._validation_visuals: Dict[str, tuple] = {}
+        self._validation_metrics: Dict[str, tuple] = {}
+        self._train_generator: Optional[torch.Generator] = None
+        self._validation_generator: Optional[torch.Generator] = None
+        self._pending_train_generator_state: Optional[torch.Tensor] = None
+        self._train_batch_started_at: Optional[float] = None
 
     def forward(self, z, L, r, t, *, return_velocity: bool = True):
         return self.model(z, L, r, t, return_velocity=return_velocity)
@@ -79,14 +96,23 @@ class PMFColorizerModule(pl.LightningModule):
         return self.model.sample_lab(L, **kwargs)
 
     def training_step(self, batch: dict, batch_idx: int):
-        started = time.perf_counter()
+        if self._train_generator is None:
+            self._train_generator = torch.Generator(device=batch["ab"].device)
+            self._train_generator.manual_seed(
+                self.random_seed + 1_000_003 * int(self.global_rank)
+            )
         terms = meanflow_terms(
             self.model,
             batch["ab"],
             batch["L"],
             auxiliary_weight=self.auxiliary_weight,
+            generator=self._train_generator,
+            p_mean=self.time_p_mean,
+            p_std=self.time_p_std,
+            data_proportion=self.time_data_proportion,
+            tr_uniform=self.time_tr_uniform,
+            uniform_probability=self.time_uniform_probability,
         )
-        elapsed = max(time.perf_counter() - started, 1.0e-6)
         batch_size = batch["ab"].shape[0]
         self.log(
             "train/pMF_loss",
@@ -113,10 +139,18 @@ class PMFColorizerModule(pl.LightningModule):
             batch_size=batch_size,
         )
         self.log(
-            "train/samples_per_sec",
-            batch_size / elapsed,
+            "train/raw_main_velocity_mse",
+            terms.main_velocity_mse_per_example.mean(),
             on_step=True,
-            on_epoch=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train/raw_auxiliary_velocity_mse",
+            terms.auxiliary_velocity_mse_per_example.mean(),
+            on_step=True,
+            on_epoch=True,
             sync_dist=True,
             batch_size=batch_size,
         )
@@ -130,7 +164,34 @@ class PMFColorizerModule(pl.LightningModule):
         )
         return terms.total_loss
 
+    def on_train_batch_start(self, batch: dict, batch_idx: int):
+        self._train_batch_started_at = time.perf_counter()
+
+    def on_train_batch_end(self, outputs, batch: dict, batch_idx: int):
+        if self._train_batch_started_at is None:
+            return
+        elapsed = max(time.perf_counter() - self._train_batch_started_at, 1.0e-6)
+        world_size = int(getattr(self.trainer, "world_size", 1))
+        global_samples = batch["ab"].shape[0] * world_size
+        self.log(
+            "train/samples_per_sec",
+            global_samples / elapsed,
+            on_step=True,
+            on_epoch=False,
+            sync_dist=False,
+            rank_zero_only=True,
+        )
+        self._train_batch_started_at = None
+
     def on_train_start(self):
+        self._train_generator = torch.Generator(device=self.device)
+        if self._pending_train_generator_state is not None:
+            self._train_generator.set_state(self._pending_train_generator_state)
+            self._pending_train_generator_state = None
+        else:
+            self._train_generator.manual_seed(
+                self.random_seed + 1_000_003 * int(self.global_rank)
+            )
         world_size = int(getattr(self.trainer, "world_size", 1))
         datamodule_hparams = getattr(self.trainer.datamodule, "hparams", None)
         batch_size = getattr(datamodule_hparams, "batch_size", None)
@@ -153,49 +214,97 @@ class PMFColorizerModule(pl.LightningModule):
             sync_dist=True,
         )
 
+    def on_validation_epoch_start(self):
+        self._validation_visuals.clear()
+        self._validation_metrics.clear()
+        self._validation_generator = torch.Generator(device=self.device)
+        self._validation_generator.manual_seed(
+            self.random_seed + 2_000_033 * (int(self.current_epoch) + 1)
+        )
+
     def validation_step(self, batch: dict, batch_idx: int):
         terms = meanflow_terms(
             self.model,
             batch["ab"],
             batch["L"],
             auxiliary_weight=self.auxiliary_weight,
+            generator=self._validation_generator,
+            p_mean=self.time_p_mean,
+            p_std=self.time_p_std,
+            data_proportion=self.time_data_proportion,
+            tr_uniform=self.time_tr_uniform,
+            uniform_probability=self.time_uniform_probability,
         )
-        self.log(
-            "val/pMF_loss",
-            terms.main_loss,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch["ab"].shape[0],
-        )
-        self.log(
-            "val/total_loss",
-            terms.total_loss,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch["ab"].shape[0],
-        )
-        if self.global_rank == 0:
-            for index, image_id in enumerate(batch["image_id"]):
-                if image_id in self.fixed_validation_ids:
-                    self._validation_visuals[image_id] = (
-                        batch["L"][index : index + 1].detach().cpu(),
-                        batch["ab"][index : index + 1].detach().cpu(),
-                    )
+        for index, image_id in enumerate(batch["image_id"]):
+            image_id = str(image_id)
+            self._validation_metrics[image_id] = (
+                float(terms.main_loss_per_example[index].detach().cpu()),
+                float(terms.total_loss_per_example[index].detach().cpu()),
+                float(terms.main_velocity_mse_per_example[index].detach().cpu()),
+                float(
+                    terms.auxiliary_velocity_mse_per_example[index]
+                    .detach()
+                    .cpu()
+                ),
+            )
+            if image_id in self.fixed_validation_ids:
+                self._validation_visuals[image_id] = (
+                    batch["L"][index : index + 1].detach().cpu(),
+                    batch["ab"][index : index + 1].detach().cpu(),
+                )
 
     def on_validation_epoch_end(self):
         visuals = self._validation_visuals
+        metrics = self._validation_metrics
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             gathered = [None for _ in range(torch.distributed.get_world_size())]
-            torch.distributed.all_gather_object(gathered, visuals)
+            torch.distributed.all_gather_object(
+                gathered, {"visuals": visuals, "metrics": metrics}
+            )
             if self.global_rank == 0:
                 visuals = {}
-                for rank_visuals in gathered:
-                    visuals.update(rank_visuals)
+                metrics = {}
+                for rank_payload in gathered:
+                    visuals.update(rank_payload["visuals"])
+                    metrics.update(rank_payload["metrics"])
         if self.global_rank != 0:
             self._validation_visuals.clear()
+            self._validation_metrics.clear()
             return
+        if metrics:
+            values = torch.tensor(list(metrics.values()), device=self.device)
+            self.log(
+                "val/pMF_loss",
+                values[:, 0].mean(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+                rank_zero_only=True,
+            )
+            self.log(
+                "val/total_loss",
+                values[:, 1].mean(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+                rank_zero_only=True,
+            )
+            self.log(
+                "val/raw_main_velocity_mse",
+                values[:, 2].mean(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+                rank_zero_only=True,
+            )
+            self.log(
+                "val/raw_auxiliary_velocity_mse",
+                values[:, 3].mean(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+                rank_zero_only=True,
+            )
         output_dir = Path(self.trainer.default_root_dir) / self.sample_dir
         for image_id, (L, gt) in visuals.items():
             seeds = list(range(1, 5))
@@ -210,6 +319,35 @@ class PMFColorizerModule(pl.LightningModule):
                 generated,
             )
         self._validation_visuals.clear()
+        self._validation_metrics.clear()
+
+    def on_save_checkpoint(self, checkpoint: dict):
+        if self._train_generator is not None:
+            checkpoint["train_generator_state"] = self._train_generator.get_state()
+
+    def on_load_checkpoint(self, checkpoint: dict):
+        self._pending_train_generator_state = checkpoint.get("train_generator_state")
+        saved_hyperparameters = checkpoint.get("hyper_parameters", {})
+        protected_keys = (
+            "learning_rate",
+            "weight_decay",
+            "warmup_steps",
+            "max_steps",
+            "auxiliary_weight",
+            "time_p_mean",
+            "time_p_std",
+            "time_data_proportion",
+            "time_tr_uniform",
+            "time_uniform_probability",
+            "random_seed",
+        )
+        for key in protected_keys:
+            if key in saved_hyperparameters and saved_hyperparameters[key] != getattr(
+                self, key
+            ):
+                raise ValueError(
+                    f"resume configuration changed protected training value {key}"
+                )
 
     def on_before_optimizer_step(self, optimizer):
         squared_norm = torch.zeros((), device=self.device)

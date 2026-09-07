@@ -29,6 +29,7 @@ def main():
     data = config["data"]
     model_config = config["model"]
     training = config["training"]
+    time_sampling = training.get("time_sampling", {})
     module = PMFColorizerModule(
         model=model_config,
         learning_rate=training["learning_rate"],
@@ -36,6 +37,12 @@ def main():
         warmup_steps=training["warmup_steps"],
         max_steps=training.get("max_steps"),
         auxiliary_weight=training["auxiliary_weight"],
+        time_p_mean=time_sampling.get("p_mean", 0.8),
+        time_p_std=time_sampling.get("p_std", 0.8),
+        time_data_proportion=time_sampling.get("data_proportion", 0.5),
+        time_tr_uniform=time_sampling.get("tr_uniform", False),
+        time_uniform_probability=time_sampling.get("uniform_probability", 0.1),
+        random_seed=config.get("seed", 1234),
         fixed_validation_ids=config.get("validation", {}).get("image_ids", []),
         sample_dir=training.get("sample_dir", "qualitative"),
     )

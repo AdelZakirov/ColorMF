@@ -20,21 +20,28 @@ class ToyModel(nn.Module):
         self.velocity_bias = nn.Parameter(torch.tensor(-0.21))
 
     def forward(self, z, L, r, t):
-        clean = self.clean_scale * z + 0.11 * L
+        clean = (
+            self.clean_scale * z
+            + 0.07 * r[:, None, None, None]
+            - 0.13 * t[:, None, None, None]
+            + 0.11 * L
+        )
         velocity = self.clean_scale * z + self.velocity_bias
         return clean, velocity
 
 
 def reference_average(z, clean, velocity, r, t):
     del velocity, r
-    return (z - clean) / t.clamp(0.05, 1.0)[:, None, None, None]
+    clipped = torch.minimum(torch.maximum(t, t.new_tensor(0.05)), t.new_tensor(1.0))
+    return (z - clean) / clipped[:, None, None, None]
 
 
 def reference_terms(model, x, L, noise, r, t, auxiliary_weight):
     z = torch.lerp(x, noise, t[:, None, None, None])
     clean, velocity = model(z, L, r, t)
     _, jvp_direction = model(z, L, t, t)
-    target = (z - x) / t.clamp(0.05, 1.0)[:, None, None, None]
+    clipped = torch.minimum(torch.maximum(t, t.new_tensor(0.05)), t.new_tensor(1.0))
+    target = (z - x) / clipped[:, None, None, None]
     average = reference_average(z, clean, velocity, r, t)
     ones = torch.ones_like(t)
     zeros = torch.zeros_like(r)
@@ -46,7 +53,7 @@ def reference_terms(model, x, L, noise, r, t, auxiliary_weight):
         )
 
     _, jvp = torch.func.jvp(
-        fn, (z, r, t), (jvp_direction.detach(), ones, zeros)
+        fn, (z, r, t), (jvp_direction.detach(), zeros, ones)
     )
     corrected = average + (t - r)[:, None, None, None] * jvp.detach()
     main_residual = (corrected.float() - target.float()).pow(2).flatten(1).sum(dim=1)
@@ -68,7 +75,7 @@ def reference_terms(model, x, L, noise, r, t, auxiliary_weight):
 
 class PmfMathTests(unittest.TestCase):
     def test_analytical_jvp(self):
-        # g(z,r,t) = 2z + 3r - 5t, tangent (v,1,0) -> 2v + 3.
+        # g(z,r,t) = 2z + 3r - 5t, tangent (v,0,1) -> 2v - 5.
         z = torch.randn(2, 2, 3, 3)
         r = torch.rand(2)
         t = torch.rand(2)
@@ -80,9 +87,9 @@ class PmfMathTests(unittest.TestCase):
         _, actual = torch.func.jvp(
             function,
             (z, r, t),
-            (direction, torch.ones_like(r), torch.zeros_like(t)),
+            (direction, torch.zeros_like(r), torch.ones_like(t)),
         )
-        expected = 2.0 * direction + 3.0
+        expected = 2.0 * direction - 5.0
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
 
     def test_production_matches_independent_reference_forward_jvp_loss_gradients(self):
@@ -131,6 +138,18 @@ class PmfMathTests(unittest.TestCase):
         t = torch.tensor([0.01])
         result = average_velocity(z, clean, t)
         self.assertTrue(torch.equal(result, torch.full_like(z, 20.0)))
+
+    def test_clipping_ties_use_half_derivative(self):
+        z = torch.ones(2, 2, 1, 1)
+        clean = torch.zeros_like(z)
+        t = torch.tensor([0.05, 1.0])
+        _, tangent = torch.func.jvp(
+            lambda value: average_velocity(z, clean, value),
+            (t,),
+            (torch.ones_like(t),),
+        )
+        expected = torch.tensor([-200.0, -0.5]).reshape(2, 1, 1, 1)
+        self.assertTrue(torch.equal(tangent, expected.expand_as(tangent)))
 
 
 if __name__ == "__main__":

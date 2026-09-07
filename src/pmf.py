@@ -31,6 +31,11 @@ class MeanFlowTerms:
     main_loss: Tensor
     auxiliary_loss: Tensor
     total_loss: Tensor
+    main_loss_per_example: Tensor
+    auxiliary_loss_per_example: Tensor
+    total_loss_per_example: Tensor
+    main_velocity_mse_per_example: Tensor
+    auxiliary_velocity_mse_per_example: Tensor
 
 
 def sample_rt(
@@ -39,8 +44,8 @@ def sample_rt(
     *,
     dtype: torch.dtype = torch.float32,
     generator: Optional[torch.Generator] = None,
-    p_mean: float = -0.4,
-    p_std: float = 1.0,
+    p_mean: float = 0.8,
+    p_std: float = 0.8,
     data_proportion: float = 0.5,
     tr_uniform: bool = False,
     uniform_probability: float = 0.1,
@@ -94,12 +99,19 @@ def interpolate(x: Tensor, noise: Tensor, t: Tensor) -> Tensor:
     return torch.lerp(x, noise, t_view)
 
 
+def _reference_clip_time(t: Tensor) -> Tensor:
+    time = t.float()
+    return torch.minimum(
+        torch.maximum(time, time.new_tensor(0.05)), time.new_tensor(1.0)
+    )
+
+
 def stabilized_velocity_target(
     x: Tensor, noise: Tensor, z: Tensor, t: Tensor
 ) -> Tensor:
     """Reference target with the pMF ``clip(t, 0.05, 1)`` endpoint policy."""
 
-    denominator = t.float().clamp(0.05, 1.0).reshape(
+    denominator = _reference_clip_time(t).reshape(
         -1, *([1] * (x.ndim - 1))
     )
     return (z.float() - x.float()) / denominator
@@ -112,7 +124,7 @@ def average_velocity(
 ) -> Tensor:
     """Reference clean-x velocity ``(z_t - x_hat) / clip(t, 0.05, 1)``."""
 
-    denominator = t.float().clamp(0.05, 1.0).reshape(
+    denominator = _reference_clip_time(t).reshape(
         -1, *([1] * (z.ndim - 1))
     )
     return (z.float() - clean_prediction.float()) / denominator
@@ -129,12 +141,12 @@ def jvp_average_velocity(
     """Compute the pMF spatial/time JVP with fixed ``L``.
 
     The primals are ``(z, r, t)`` and the tangents are
-    ``(stop_gradient(v_dir), 1, 0)``.  The condition is deliberately not a
+    ``(stop_gradient(v_dir), 0, 1)``.  The condition is deliberately not a
     primal: changing ``L`` is never part of the stochastic tangent.
     """
 
-    ones = torch.ones_like(t)
     zeros = torch.zeros_like(r)
+    ones = torch.ones_like(t)
 
     def average_velocity_fn(z_value: Tensor, r_value: Tensor, t_value: Tensor):
         clean_value, _ = model(z_value, L, r_value, t_value)
@@ -143,7 +155,7 @@ def jvp_average_velocity(
     _, tangent = torch.func.jvp(
         average_velocity_fn,
         (z, r, t),
-        (velocity_direction.detach(), ones, zeros),
+        (velocity_direction.detach(), zeros, ones),
     )
     return tangent
 
@@ -160,6 +172,11 @@ def meanflow_terms(
     auxiliary_weight: float = 1.0,
     adaptive_power: float = 1.0,
     adaptive_epsilon: float = 0.01,
+    p_mean: float = 0.8,
+    p_std: float = 0.8,
+    data_proportion: float = 0.5,
+    tr_uniform: bool = False,
+    uniform_probability: float = 0.1,
 ) -> MeanFlowTerms:
     """Evaluate the production pMF objective and expose every audit value."""
 
@@ -173,7 +190,15 @@ def meanflow_terms(
         )
     if r is None or t is None:
         sampled_r, sampled_t = sample_rt(
-            x.shape[0], x.device, dtype=x.dtype, generator=generator
+            x.shape[0],
+            x.device,
+            dtype=x.dtype,
+            generator=generator,
+            p_mean=p_mean,
+            p_std=p_std,
+            data_proportion=data_proportion,
+            tr_uniform=tr_uniform,
+            uniform_probability=uniform_probability,
         )
         r = sampled_r if r is None else r
         t = sampled_t if t is None else t
@@ -188,16 +213,20 @@ def meanflow_terms(
     corrected = average + delta * jvp.detach()
 
     # Scalar math and reductions intentionally run in FP32 under BF16 AMP.
-    def adaptive_squared_loss(prediction: Tensor) -> Tensor:
-        per_example = prediction.float().pow(2).flatten(1).sum(dim=1)
+    def adaptive_squared_loss(prediction: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        squared = prediction.float().pow(2).flatten(1)
+        per_example = squared.sum(dim=1)
         denominator = (
             (per_example + adaptive_epsilon).pow(adaptive_power).detach()
         )
-        return (per_example / denominator).mean()
+        return (per_example / denominator).mean(), per_example / denominator, squared.mean(dim=1)
 
-    main = adaptive_squared_loss(corrected - target)
-    auxiliary = adaptive_squared_loss(velocity_prediction - target)
+    main, main_per_example, main_mse = adaptive_squared_loss(corrected - target)
+    auxiliary, auxiliary_per_example, auxiliary_mse = adaptive_squared_loss(
+        velocity_prediction - target
+    )
     total = main + auxiliary_weight * auxiliary
+    total_per_example = main_per_example + auxiliary_weight * auxiliary_per_example
     return MeanFlowTerms(
         z=z,
         r=r,
@@ -212,4 +241,9 @@ def meanflow_terms(
         main_loss=main,
         auxiliary_loss=auxiliary,
         total_loss=total,
+        main_loss_per_example=main_per_example,
+        auxiliary_loss_per_example=auxiliary_per_example,
+        total_loss_per_example=total_per_example,
+        main_velocity_mse_per_example=main_mse,
+        auxiliary_velocity_mse_per_example=auxiliary_mse,
     )

@@ -66,7 +66,7 @@ The equation-to-code map is:
 | clean-x output | `PMFTiny.clean_head` | data endpoint estimate |
 | average velocity | `src/pmf.py:average_velocity` | `(z-x_hat)/clip(t,0.05,1)` |
 | auxiliary instantaneous velocity | `PMFTiny.velocity_head` plus `average_velocity` | sampled-interval v loss and h=0 tangent |
-| JVP primals/tangents | `src/pmf.py:jvp_average_velocity` | `(z,r,t)` along `(v_dir,1,0)` with fixed L |
+| JVP primals/tangents | `src/pmf.py:jvp_average_velocity` | `(z,r,t)` along `(v_dir,0,1)` with fixed L |
 | stop-gradient | `src/pmf.py:meanflow_terms` | `jvp.detach()` in corrected velocity |
 | main and auxiliary losses | `src/pmf.py:meanflow_terms` | adaptive summed velocity losses |
 | one-step sampler | `PMFTiny.sample` | one main model evaluation |
@@ -82,6 +82,10 @@ normalized with `S / stop_gradient((S + 0.01)^1)`. The configurable
 `auxiliary_weight` defaults to one, matching the official pMF sum; no
 perceptual losses are enabled in V1.
 
+The pilot explicitly uses the published 256px B/16 logit-normal recipe
+`p_mean=0.8`, `p_std=0.8`, with the flow-matching diagonal proportion and
+uniform replacement probability configurable under `training.time_sampling`.
+
 ## LAB convention
 
 The legacy `/mnt/WORKSPACE/aza_workspace/palette` loader was audited. It reads
@@ -89,7 +93,10 @@ RGB with OpenCV, uses a random 256 crop followed by resize, brightness/
 contrast or CLAHE, horizontal flip, and optional border/texture/noise
 augmentation, converts with `cv2.COLOR_RGB2LAB`, and applies
 `Normalize(max_pixel_value=127.5)`. ColorMF preserves the conversion and
-geometric behavior but defaults to crop/resize plus horizontal flip only:
+uses crop/resize plus horizontal flip only. It intentionally conditions on
+OpenCV LAB `L`, not the legacy loader's `ToGray(RGB)` output, and its training
+crop is always selected when the source image is large enough. These are
+intentional differences rather than a claim of legacy-equivalent preprocessing:
 photometric and synthetic noise augmentation would change the conditional
 color distribution rather than merely regularize geometry.
 
@@ -136,10 +143,13 @@ python sample.py --config configs/pilot.yaml \
 ```
 
 Set `training.devices` to an integer greater than one to use Lightning-native
-`strategy="ddp"`. Metrics use `sync_dist=True`, Lightning owns distributed
-sampling and checkpointing, and only global rank zero writes qualitative
-grids. Fixed validation examples are gathered from ranks before that write;
-their seeds are derived from stable image-ID/sample-index pairs.
+`strategy="ddp"`. Training metrics use `sync_dist=True`; validation metrics
+are deduplicated by image ID after gathering padded distributed shards.
+Lightning owns distributed sampling and checkpointing, and only global rank
+zero writes qualitative grids after collecting requested examples from every
+rank. Objective RNG streams are rank-separated and their generator state is
+stored in checkpoints. Data-order and augmentation state are not promised to
+resume bit-for-bit.
 
 Conservative AdamW, warmup, clipping, and BF16 settings in the pilot config
 are experiment settings, not pMF requirements. Mathematical tests are FP32;
@@ -152,6 +162,7 @@ Implemented and runnable:
 
 * FP32 analytical JVP test;
 * independent pMF forward/JVP/loss/gradient comparison;
+* fixed 2-D patch positional representation;
 * LAB normalization and RGB conversion tests;
 * one-step sampling, NFE count, and batch/individual seed reproducibility;
 * single-batch transformer pMF smoke test;
@@ -159,7 +170,8 @@ Implemented and runnable:
 * Python 3.13 environment with the mounted dataset adapter;
 * one real-data BF16 Lightning training batch at the configured 256x256 shape
   on an RTX 4090;
-* checkpoint save/resume through Lightning;
+* checkpoint save/resume through Lightning, including objective RNG state and
+  protected training-configuration checks;
 * one-step GPU sampling with stable image-ID/seed noise and exact luminance
   preservation;
 * fixed validation qualitative-grid generation.

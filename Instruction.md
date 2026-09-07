@@ -216,8 +216,8 @@ The core structure must match the reference logic:
 v_dir = predicted instantaneous velocity
 
 J = JVP of u_theta
-    with respect to (z, t, r)
-    along (v_dir, 1, 0)
+    with respect to (z, r, t)
+    along (v_dir, 0, 1)
 
 L is fixed.
 
