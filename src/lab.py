@@ -67,8 +67,9 @@ def rgb_to_lab(image: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
     if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != np.uint8:
         raise ValueError("rgb_to_lab expects an RGB uint8 array shaped [H, W, 3]")
     encoded = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
-    L = torch.tensor(encoded[..., :1].tolist()).permute(2, 0, 1).float()
-    ab = torch.tensor(encoded[..., 1:].tolist()).permute(2, 0, 1).float()
+    channels = torch.from_numpy(encoded.transpose(2, 0, 1)).float()
+    L = channels[:1]
+    ab = channels[1:]
     return L / _LAB_SCALE - 1.0, ab / _LAB_SCALE - 1.0
 
 

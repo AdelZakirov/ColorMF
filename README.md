@@ -167,7 +167,16 @@ the tracking UI in a second terminal with:
 Open `http://127.0.0.1:5000` to inspect the `tmp` experiment. The run records
 the flattened training configuration as parameters, all Lightning training
 and validation metrics, and qualitative validation grids as artifacts under
-`./mlartifacts`.
+`./mlartifacts`. By default, the first four validation images are rendered as
+`L | GT | seed1 | seed2 | seed3 | seed4` grids. Set `validation.image_ids` to
+choose specific examples, or change `validation.image_count` and
+`validation.sample_seeds`. The grids are logged under `qualitative/current/`;
+the same artifact paths are replaced after each validation epoch rather than
+creating an unbounded epoch-by-epoch image history.
+Training maintains an EMA shadow with decay `0.9999`; EMA starts after the
+configured warm-up and validation and qualitative grids use it only after it is
+ready. EMA state is included in checkpoints. Standalone sampling uses EMA
+weights when they are ready; pass `--no-ema` to use the raw checkpoint weights.
 Checkpoints remain in `training.checkpoint_dir` and are not duplicated into
 MLflow by default. To use the shared server instead, change
 `training.logger.tracking_uri` to its HTTPS URL.
@@ -190,7 +199,7 @@ Implemented and runnable:
   protected training-configuration checks;
 * one-step GPU sampling with stable image-ID/seed noise and exact luminance
   preservation;
-* fixed validation qualitative-grid generation.
+* fixed validation qualitative-grid generation with MLflow artifact replacement.
 
 `NOT TESTED`: this checkout exposes one GPU, so a multi-GPU DDP smoke test,
 distributed metric run, and real multi-GPU pilot remain unverified. The mounted

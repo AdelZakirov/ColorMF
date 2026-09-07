@@ -103,6 +103,7 @@ def log_mlflow_metadata(logger, config: dict, module: PMFColorizerModule) -> Non
         "training/accumulate_grad_batches": training.get(
             "accumulate_grad_batches"
         ),
+        "training/ema": training.get("ema", {}),
         "sampling/time_sampling": training.get("time_sampling", {}),
     }
     for key, value in tags.items():
@@ -118,6 +119,8 @@ def main():
     data = config["data"]
     model_config = config["model"]
     training = config["training"]
+    validation = config.get("validation", {})
+    ema = training.get("ema") or {}
     time_sampling = training.get("time_sampling", {})
     module = PMFColorizerModule(
         model=model_config,
@@ -132,7 +135,13 @@ def main():
         time_tr_uniform=time_sampling.get("tr_uniform", False),
         time_uniform_probability=time_sampling.get("uniform_probability", 0.1),
         random_seed=config.get("seed", 1234),
-        fixed_validation_ids=config.get("validation", {}).get("image_ids", []),
+        fixed_validation_ids=validation.get("image_ids", []),
+        validation_image_count=validation.get("image_count", 4),
+        validation_sample_seeds=validation.get("sample_seeds"),
+        ema_decay=ema.get("decay") if ema.get("enabled", True) else None,
+        ema_update_after_step=ema.get("update_after_step", 0),
+        ema_update_every=ema.get("update_every", 1),
+        ema_use_for_validation=ema.get("use_for_validation", True),
         sample_dir=training.get("sample_dir", "qualitative"),
     )
     datamodule = PaletteDataModule(**data)

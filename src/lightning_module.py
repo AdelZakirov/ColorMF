@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Sequence
 
 import numpy as np
 import pytorch_lightning as pl
@@ -15,6 +15,7 @@ from pytorch_lightning.loggers import MLFlowLogger
 from PIL import Image, ImageDraw
 
 from .lab import lab_to_rgb
+from .ema import ExponentialMovingAverage
 from .model import PMFTiny
 from .pmf import meanflow_terms
 
@@ -42,6 +43,20 @@ def _save_qualitative_row(
     canvas.save(filename)
 
 
+def _select_validation_visuals(
+    visuals: Dict[str, tuple],
+    fixed_validation_ids: set[str],
+    validation_image_count: int,
+) -> Dict[str, tuple]:
+    if fixed_validation_ids:
+        return {
+            image_id: visuals[image_id]
+            for image_id in sorted(fixed_validation_ids)
+            if image_id in visuals
+        }
+    return dict(sorted(visuals.items())[:validation_image_count])
+
+
 class PMFColorizerModule(pl.LightningModule):
     def __init__(
         self,
@@ -59,6 +74,12 @@ class PMFColorizerModule(pl.LightningModule):
         time_uniform_probability: float = 0.1,
         random_seed: int = 1234,
         fixed_validation_ids: Optional[Iterable[str]] = None,
+        validation_image_count: int = 4,
+        validation_sample_seeds: Optional[Sequence[int]] = None,
+        ema_decay: Optional[float] = 0.9999,
+        ema_update_after_step: int = 0,
+        ema_update_every: int = 1,
+        ema_use_for_validation: bool = True,
         sample_dir: str = "qualitative",
     ):
         super().__init__()
@@ -77,6 +98,30 @@ class PMFColorizerModule(pl.LightningModule):
         self.time_uniform_probability = time_uniform_probability
         self.random_seed = random_seed
         self.fixed_validation_ids = set(fixed_validation_ids or [])
+        self.validation_image_count = max(0, int(validation_image_count))
+        sample_seeds = (
+            validation_sample_seeds
+            if validation_sample_seeds is not None
+            else (1, 2, 3, 4)
+        )
+        self.validation_sample_seeds = tuple(int(seed) for seed in sample_seeds)
+        if not self.validation_sample_seeds:
+            raise ValueError("validation_sample_seeds must not be empty")
+        self.ema_decay = ema_decay
+        self.ema_update_after_step = int(ema_update_after_step)
+        self.ema_update_every = int(ema_update_every)
+        self.ema = (
+            ExponentialMovingAverage(
+                decay=ema_decay,
+                update_after_step=self.ema_update_after_step,
+                update_every=self.ema_update_every,
+            )
+            if ema_decay is not None
+            else None
+        )
+        self.ema_use_for_validation = ema_use_for_validation
+        self._pending_ema_state: Optional[dict] = None
+        self._ema_validation_applied = False
         self.sample_dir = sample_dir
         self._validation_visuals: Dict[str, tuple] = {}
         self._validation_metrics: Dict[str, tuple] = {}
@@ -193,6 +238,13 @@ class PMFColorizerModule(pl.LightningModule):
             self._train_generator.manual_seed(
                 self.random_seed + 1_000_003 * int(self.global_rank)
             )
+        if self.ema is not None:
+            if self._pending_ema_state is not None:
+                self.ema.load_state_dict(self._pending_ema_state)
+                self._pending_ema_state = None
+            else:
+                self.ema.initialize(self.model)
+            self.ema.move_to(self.model)
         world_size = int(getattr(self.trainer, "world_size", 1))
         datamodule_hparams = getattr(self.trainer.datamodule, "hparams", None)
         batch_size = getattr(datamodule_hparams, "batch_size", None)
@@ -218,6 +270,14 @@ class PMFColorizerModule(pl.LightningModule):
     def on_validation_epoch_start(self):
         self._validation_visuals.clear()
         self._validation_metrics.clear()
+        if (
+            self.ema is not None
+            and self.ema_use_for_validation
+            and self.ema.ready
+        ):
+            self.ema.store(self.model)
+            self.ema.copy_to(self.model)
+            self._ema_validation_applied = True
         self._validation_generator = torch.Generator(device=self.device)
         self._validation_generator.manual_seed(
             self.random_seed + 2_000_033 * (int(self.current_epoch) + 1)
@@ -248,7 +308,12 @@ class PMFColorizerModule(pl.LightningModule):
                     .cpu()
                 ),
             )
-            if image_id in self.fixed_validation_ids:
+            should_capture = (
+                image_id in self.fixed_validation_ids
+                if self.fixed_validation_ids
+                else len(self._validation_visuals) < self.validation_image_count
+            )
+            if should_capture:
                 self._validation_visuals[image_id] = (
                     batch["L"][index : index + 1].detach().cpu(),
                     batch["ab"][index : index + 1].detach().cpu(),
@@ -269,77 +334,107 @@ class PMFColorizerModule(pl.LightningModule):
                     visuals.update(rank_payload["visuals"])
                     metrics.update(rank_payload["metrics"])
         if self.global_rank != 0:
+            self._restore_training_weights()
             self._validation_visuals.clear()
             self._validation_metrics.clear()
             return
-        if metrics:
-            values = torch.tensor(list(metrics.values()), device=self.device)
-            self.log(
-                "val/pMF_loss",
-                values[:, 0].mean(),
-                on_step=False,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
+        try:
+            visuals = _select_validation_visuals(
+                visuals,
+                self.fixed_validation_ids,
+                self.validation_image_count,
             )
-            self.log(
-                "val/total_loss",
-                values[:, 1].mean(),
-                on_step=False,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
+            if metrics:
+                values = torch.tensor(list(metrics.values()), device=self.device)
+                self.log(
+                    "val/pMF_loss",
+                    values[:, 0].mean(),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )
+                self.log(
+                    "val/total_loss",
+                    values[:, 1].mean(),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )
+                self.log(
+                    "val/raw_main_velocity_mse",
+                    values[:, 2].mean(),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )
+                self.log(
+                    "val/raw_auxiliary_velocity_mse",
+                    values[:, 3].mean(),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )
+            output_dir = (
+                Path(self.trainer.default_root_dir) / self.sample_dir / "current"
             )
-            self.log(
-                "val/raw_main_velocity_mse",
-                values[:, 2].mean(),
-                on_step=False,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
-            )
-            self.log(
-                "val/raw_auxiliary_velocity_mse",
-                values[:, 3].mean(),
-                on_step=False,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
-            )
-        output_dir = Path(self.trainer.default_root_dir) / self.sample_dir
-        for image_id, (L, gt) in visuals.items():
-            seeds = list(range(1, 5))
-            device = self.device
-            generated = self.model.sample(
-                L.to(device), seeds=seeds, image_ids=[image_id]
-            ).cpu()
-            filename = str(
-                output_dir / f"epoch-{self.current_epoch:04d}-{image_id}.png"
-            )
-            _save_qualitative_row(
-                filename,
-                L,
-                gt,
-                generated,
-            )
-            self._log_mlflow_artifact(filename)
-        self._validation_visuals.clear()
-        self._validation_metrics.clear()
+            artifact_path = f"{self.sample_dir.rstrip('/')}/current"
+            for image_id, (L, gt) in visuals.items():
+                device = self.device
+                generated = self.model.sample(
+                    L.to(device),
+                    seeds=self.validation_sample_seeds,
+                    image_ids=[image_id],
+                ).cpu()
+                safe_image_id = "".join(
+                    character
+                    if character.isalnum() or character in "._-"
+                    else "_"
+                    for character in image_id
+                ).strip("._") or "image"
+                filename = str(output_dir / f"{safe_image_id}.png")
+                _save_qualitative_row(
+                    filename,
+                    L,
+                    gt,
+                    generated,
+                )
+                self._log_mlflow_artifact(filename, artifact_path)
+        finally:
+            self._restore_training_weights()
+            self._validation_visuals.clear()
+            self._validation_metrics.clear()
 
-    def _log_mlflow_artifact(self, filename: str) -> None:
+    def _restore_training_weights(self) -> None:
+        if not self._ema_validation_applied:
+            return
+        assert self.ema is not None
+        self.ema.restore(self.model)
+        self._ema_validation_applied = False
+
+    def _log_mlflow_artifact(self, filename: str, artifact_path: str) -> None:
         for logger in getattr(self.trainer, "loggers", []):
             if not isinstance(logger, MLFlowLogger):
                 continue
             logger.experiment.log_artifact(
-                logger.run_id, filename, artifact_path="qualitative"
+                logger.run_id, filename, artifact_path=artifact_path
             )
 
     def on_save_checkpoint(self, checkpoint: dict):
         if self._train_generator is not None:
             checkpoint["train_generator_state"] = self._train_generator.get_state()
+        checkpoint["ema"] = (
+            self.ema.state_dict()
+            if self.ema is not None and self.ema.initialized
+            else None
+        )
 
     def on_load_checkpoint(self, checkpoint: dict):
         self._pending_train_generator_state = checkpoint.get("train_generator_state")
+        self._pending_ema_state = checkpoint.get("ema")
         saved_hyperparameters = checkpoint.get("hyper_parameters", {})
         protected_keys = (
             "learning_rate",
@@ -353,6 +448,9 @@ class PMFColorizerModule(pl.LightningModule):
             "time_tr_uniform",
             "time_uniform_probability",
             "random_seed",
+            "ema_decay",
+            "ema_update_after_step",
+            "ema_update_every",
         )
         for key in protected_keys:
             if key in saved_hyperparameters and saved_hyperparameters[key] != getattr(
@@ -361,6 +459,11 @@ class PMFColorizerModule(pl.LightningModule):
                 raise ValueError(
                     f"resume configuration changed protected training value {key}"
                 )
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+        if self.ema is not None:
+            self.ema.update(self.model)
 
     def on_before_optimizer_step(self, optimizer):
         squared_norm = torch.zeros((), device=self.device)
@@ -375,6 +478,20 @@ class PMFColorizerModule(pl.LightningModule):
             on_epoch=False,
             sync_dist=True,
         )
+
+    def load_ema_state_dict(self, state: Optional[dict]) -> bool:
+        if state is None or self.ema is None:
+            return False
+        self.ema.load_state_dict(state)
+        self.ema.move_to(self.model)
+        return True
+
+    def ema_scope(self):
+        if self.ema is None or not self.ema.ready:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return self.ema.scope(self.model)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(

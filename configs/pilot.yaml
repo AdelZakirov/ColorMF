@@ -1,7 +1,7 @@
 seed: 1234
 
 model:
-  resolution: [256, 256]
+  resolution: [128, 128]
   patch_size: 16
   hidden_size: 384
   depth: 12
@@ -13,24 +13,24 @@ data:
   #   /absolute/or/relative/path.jpg
   # or:
   #   stable-image-id<TAB>/absolute/or/relative/path.jpg
-  train_manifest: /mnt/IMAGING/HUB/DATASETS/general_datasets/animals/animals.txt
+  train_manifest: /home/AZA/datasets/ffhq/ffhq.txt
   val_manifest: null
   train_root: null
-  val_root: /mnt/IMAGING/HUB/DATASETS/general_datasets/imagenet/custom_val
-  resolution: [256, 256]
-  batch_size: 8
+  val_root: /home/AZA/datasets/test_faces
+  resolution: [128, 128]
+  batch_size: 256
   val_batch_size: 4
-  num_workers: 4
-  horizontal_flip: true
+  num_workers: 8
+  horizontal_flip: false
 
 training:
   accelerator: auto
   devices: 1
   precision: bf16-mixed
-  max_epochs: 100
+  max_epochs: 500
   max_steps: null
   accumulate_grad_batches: 1
-  learning_rate: 0.0002
+  learning_rate: 0.001
   weight_decay: 0.0001
   warmup_steps: 1000
   auxiliary_weight: 1.0
@@ -53,6 +53,14 @@ training:
     log_model: false
   sample_dir: qualitative
   sync_batchnorm: false
+  ema:
+    enabled: true
+    decay: 0.9999
+    update_after_step: 1000
+    update_every: 1
+    use_for_validation: true
 
 validation:
   image_ids: []
+  image_count: 4
+  sample_seeds: [1, 2, 3, 4]

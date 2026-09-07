@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import random
-from array import array
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
@@ -15,47 +14,44 @@ from .lab import rgb_to_lab
 
 
 class IndexedManifest:
-    """A line-indexed manifest that stores offsets, not all path strings."""
+    """A parsed manifest that keeps lightweight path entries in memory."""
 
     def __init__(self, filename: str):
         self.filename = str(filename)
         manifest_dir = Path(filename).resolve().parent
+        self.manifest_dir = manifest_dir
         candidate_image_dir = manifest_dir / "256"
         self.image_dir = (
             candidate_image_dir if candidate_image_dir.is_dir() else manifest_dir
         )
-        self.offsets = array("Q")
-        with open(self.filename, "rb") as handle:
-            while True:
-                offset = handle.tell()
-                line = handle.readline()
+        self.items: list[Tuple[str, str]] = []
+        with open(self.filename, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
                 if not line:
-                    break
-                if line.strip():
-                    self.offsets.append(offset)
+                    continue
+                if "\t" in line:
+                    image_id, path = line.split("\t", 1)
+                else:
+                    path = line
+                    image_id = Path(path).stem
+                self.items.append((image_id, path))
 
     def __len__(self) -> int:
-        return len(self.offsets)
+        return len(self.items)
 
     def __getitem__(self, index: int) -> Tuple[str, str]:
-        with open(self.filename, "rb") as handle:
-            handle.seek(self.offsets[index])
-            line = handle.readline().decode("utf-8").strip()
-        if "\t" in line:
-            image_id, path = line.split("\t", 1)
-        else:
-            path = line
-            image_id = Path(path).stem
+        image_id, path = self.items[index]
         path_object = Path(path)
         if not path_object.is_absolute():
-            candidates = (
-                self.image_dir / path_object,
-                Path(self.filename).resolve().parent / path_object,
-            )
-            path = next(
-                (str(candidate) for candidate in candidates if candidate.is_file()),
-                str(candidates[0]),
-            )
+            path = str(self.image_dir / path_object)
+        return image_id, path
+
+    def fallback(self, index: int) -> Tuple[str, str]:
+        image_id, path = self.items[index]
+        path_object = Path(path)
+        if not path_object.is_absolute():
+            path = str(self.manifest_dir / path_object)
         return image_id, path
 
 
@@ -90,19 +86,16 @@ class PaletteDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         image_id, path = self._item(index)
         image = cv2.imread(path, cv2.IMREAD_COLOR)
+        if image is None and isinstance(self.items, IndexedManifest):
+            image_id, path = self.items.fallback(index)
+            image = cv2.imread(path, cv2.IMREAD_COLOR)
         if image is None:
             raise FileNotFoundError(f"could not decode image: {path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        height, width = image.shape[:2]
         target_height, target_width = self.size
-        if self.train and min(height, width) >= max(self.size):
-            top = random.randint(0, height - target_height)
-            left = random.randint(0, width - target_width)
-            image = image[top : top + target_height, left : left + target_width]
-        else:
-            image = cv2.resize(
-                image, (target_width, target_height), interpolation=cv2.INTER_CUBIC
-            )
+        image = cv2.resize(
+            image, (target_width, target_height), interpolation=cv2.INTER_CUBIC
+        )
         if self.train and self.horizontal_flip and random.random() < 0.5:
             image = image[:, ::-1].copy()
         L, ab = rgb_to_lab(image)
