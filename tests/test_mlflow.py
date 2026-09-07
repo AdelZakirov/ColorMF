@@ -2,8 +2,24 @@ from pathlib import Path
 
 import mlflow
 
-from src.lightning_module import PMFColorizerModule
+from src.lightning_module import PMFColorizerModule, _select_validation_visuals
 from train import build_logger, log_mlflow_metadata
+
+
+def test_validation_visual_selection_defaults_to_sorted_first_images():
+    visuals = {"image-z": ("z",), "image-a": ("a",), "image-m": ("m",)}
+
+    selected = _select_validation_visuals(visuals, set(), 2)
+
+    assert list(selected) == ["image-a", "image-m"]
+
+
+def test_validation_visual_selection_preserves_requested_ids():
+    visuals = {"image-z": ("z",), "image-a": ("a",), "image-m": ("m",)}
+
+    selected = _select_validation_visuals(visuals, {"image-m", "missing"}, 2)
+
+    assert list(selected) == ["image-m"]
 
 
 def test_local_mlflow_logs_run_data_and_artifact(tmp_path: Path):
@@ -54,6 +70,10 @@ def test_local_mlflow_logs_run_data_and_artifact(tmp_path: Path):
     logger.experiment.log_artifact(
         logger.run_id, str(artifact), artifact_path="qualitative"
     )
+    artifact.write_text("updated qualitative output\n", encoding="utf-8")
+    logger.experiment.log_artifact(
+        logger.run_id, str(artifact), artifact_path="qualitative"
+    )
     logger.finalize("success")
 
     client = mlflow.MlflowClient(tracking_uri=f"sqlite:///{database}")
@@ -67,3 +87,9 @@ def test_local_mlflow_logs_run_data_and_artifact(tmp_path: Path):
     assert client.list_artifacts(run.info.run_id, "qualitative")[0].path == (
         "qualitative/sample.txt"
     )
+    downloaded = Path(
+        client.download_artifacts(
+            run.info.run_id, "qualitative/sample.txt", str(tmp_path / "download")
+        )
+    )
+    assert downloaded.read_text(encoding="utf-8") == "updated qualitative output\n"
