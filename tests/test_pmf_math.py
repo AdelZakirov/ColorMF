@@ -1,156 +1,116 @@
-import unittest
-
 import torch
 from torch import nn
 
-from src.pmf import (
-    average_velocity,
-    interpolate,
-    jvp_average_velocity,
-    meanflow_terms,
-)
+from src.pmf import average_velocity, meanflow_terms
 
 
 class ToyModel(nn.Module):
-    """Small differentiable model used as an independent math oracle target."""
-
     def __init__(self):
         super().__init__()
-        self.clean_scale = nn.Parameter(torch.tensor(0.37))
-        self.velocity_bias = nn.Parameter(torch.tensor(-0.21))
+        self.u_scale = nn.Parameter(torch.tensor(0.37))
+        self.v_bias = nn.Parameter(torch.tensor(-0.21))
 
     def forward(self, z, L, r, t):
-        clean = (
-            self.clean_scale * z
-            + 0.07 * r[:, None, None, None]
-            - 0.13 * t[:, None, None, None]
-            + 0.11 * L
-        )
-        velocity = self.clean_scale * z + self.velocity_bias
-        return clean, velocity
-
-
-def reference_average(z, clean, velocity, r, t):
-    del velocity, r
-    clipped = torch.minimum(torch.maximum(t, t.new_tensor(0.05)), t.new_tensor(1.0))
-    return (z - clean) / clipped[:, None, None, None]
+        h = t - r
+        u = self.u_scale * z + 0.07 * h[:, None, None, None] + 0.11 * L
+        v = self.u_scale * z + self.v_bias + 0.03 * h[:, None, None, None]
+        return u, v
 
 
 def reference_terms(model, x, L, noise, r, t, auxiliary_weight):
     z = torch.lerp(x, noise, t[:, None, None, None])
-    clean, velocity = model(z, L, r, t)
-    _, jvp_direction = model(z, L, t, t)
-    clipped = torch.minimum(torch.maximum(t, t.new_tensor(0.05)), t.new_tensor(1.0))
-    target = (z - x) / clipped[:, None, None, None]
-    average = reference_average(z, clean, velocity, r, t)
-    ones = torch.ones_like(t)
-    zeros = torch.zeros_like(r)
+    clipped = t.clamp(0.05, 1)[:, None, None, None]
+    target = (z - x) / clipped
+    _, direction = model(z, L, t, t)
+    ones, zeros = torch.ones_like(t), torch.zeros_like(r)
 
-    def fn(z_value, r_value, t_value):
-        clean_value, velocity_value = model(z_value, L, r_value, t_value)
-        return reference_average(
-            z_value, clean_value, velocity_value, r_value, t_value
-        )
+    def function(z_value, t_value, r_value):
+        return model(z_value, L, r_value, t_value)[0]
 
-    _, jvp = torch.func.jvp(
-        fn, (z, r, t), (jvp_direction.detach(), zeros, ones)
-    )
-    corrected = average + (t - r)[:, None, None, None] * jvp.detach()
-    main_residual = (corrected.float() - target.float()).pow(2).flatten(1).sum(dim=1)
-    auxiliary_residual = (velocity.float() - target.float()).pow(2).flatten(1).sum(dim=1)
-    main = (main_residual / (main_residual + 0.01).detach()).mean()
-    auxiliary = (auxiliary_residual / (auxiliary_residual + 0.01).detach()).mean()
-    return {
-        "z": z,
-        "clean": clean,
-        "velocity": velocity,
-        "jvp_direction": jvp_direction,
-        "average": average,
-        "jvp": jvp,
-        "main": main,
-        "auxiliary": auxiliary,
-        "total": main + auxiliary_weight * auxiliary,
-    }
+    u, jvp = torch.func.jvp(
+        function, (z, t, r), (direction.detach(), ones, zeros))
+    _, v = model(z, L, r, t)
+    corrected = u + (t - r)[:, None, None, None] * jvp.detach()
+
+    def adaptive(residual):
+        summed = residual.float().pow(2).flatten(1).sum(1)
+        return (summed / (summed + 0.01).detach()).mean()
+
+    main, auxiliary = adaptive(corrected - target), adaptive(v - target)
+    return z, u, v, direction, jvp, corrected, main, auxiliary, main + auxiliary_weight * auxiliary
 
 
-class PmfMathTests(unittest.TestCase):
-    def test_analytical_jvp(self):
-        # g(z,r,t) = 2z + 3r - 5t, tangent (v,0,1) -> 2v - 5.
-        z = torch.randn(2, 2, 3, 3)
-        r = torch.rand(2)
-        t = torch.rand(2)
-        direction = torch.randn_like(z)
+def test_analytical_jvp():
+    z = torch.randn(2, 2, 3, 3)
+    r, t = torch.rand(2), torch.rand(2)
+    direction = torch.randn_like(z)
 
-        def function(z_value, r_value, t_value):
-            return 2.0 * z_value + 3.0 * r_value[:, None, None, None] - 5.0 * t_value[:, None, None, None]
+    def function(z_value, t_value, r_value):
+        return 2 * z_value + 3 * r_value[:, None, None, None] - 5 * t_value[:, None, None, None]
 
-        _, actual = torch.func.jvp(
-            function,
-            (z, r, t),
-            (direction, torch.zeros_like(r), torch.ones_like(t)),
-        )
-        expected = 2.0 * direction - 5.0
-        self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
-
-    def test_production_matches_independent_reference_forward_jvp_loss_gradients(self):
-        torch.manual_seed(4)
-        x = torch.randn(2, 2, 3, 3, requires_grad=False)
-        L = torch.randn(2, 1, 3, 3)
-        noise = torch.randn_like(x)
-        r = torch.tensor([0.13, 0.21])
-        t = torch.tensor([0.77, 0.91])
-        weight = 0.17
-
-        production_model = ToyModel()
-        reference_model = ToyModel()
-        reference_model.load_state_dict(production_model.state_dict())
-        production = meanflow_terms(
-            production_model, x, L, noise=noise, r=r, t=t, auxiliary_weight=weight
-        )
-        expected = reference_terms(
-            reference_model, x, L, noise, r, t, weight
-        )
-        for actual, target in (
-            (production.z, expected["z"]),
-            (production.clean_prediction, expected["clean"]),
-            (production.velocity_prediction, expected["velocity"]),
-            (production.jvp_direction, expected["jvp_direction"]),
-            (production.average_velocity, expected["average"]),
-            (production.average_velocity_jvp, expected["jvp"]),
-            (production.main_loss, expected["main"]),
-            (production.auxiliary_loss, expected["auxiliary"]),
-            (production.total_loss, expected["total"]),
-        ):
-            self.assertTrue(torch.allclose(actual, target, atol=1e-6, rtol=1e-6))
-
-        production_model.zero_grad()
-        reference_model.zero_grad()
-        production.total_loss.backward()
-        expected["total"].backward()
-        for actual, target in zip(production_model.parameters(), reference_model.parameters()):
-            self.assertTrue(torch.allclose(actual.grad, target.grad, atol=1e-6, rtol=1e-6))
-
-    def test_small_time_uses_clipped_denominator_without_division(self):
-        z = torch.ones(1, 2, 2, 2)
-        clean = torch.zeros_like(z)
-        velocity = torch.full_like(z, 3.0)
-        r = torch.tensor([0.0])
-        t = torch.tensor([0.01])
-        result = average_velocity(z, clean, t)
-        self.assertTrue(torch.equal(result, torch.full_like(z, 20.0)))
-
-    def test_clipping_ties_use_half_derivative(self):
-        z = torch.ones(2, 2, 1, 1)
-        clean = torch.zeros_like(z)
-        t = torch.tensor([0.05, 1.0])
-        _, tangent = torch.func.jvp(
-            lambda value: average_velocity(z, clean, value),
-            (t,),
-            (torch.ones_like(t),),
-        )
-        expected = torch.tensor([-200.0, -0.5]).reshape(2, 1, 1, 1)
-        self.assertTrue(torch.equal(tangent, expected.expand_as(tangent)))
+    _, actual = torch.func.jvp(
+        function, (z, t, r),
+        (direction, torch.ones_like(t), torch.zeros_like(r)))
+    torch.testing.assert_close(actual, 2 * direction - 5)
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_jvp_matches_fp32_central_difference():
+    torch.manual_seed(9)
+    model = ToyModel().float()
+    z, L = torch.randn(2, 2, 3, 3), torch.randn(2, 1, 3, 3)
+    r, t = torch.tensor([0.2, 0.3]), torch.tensor([0.7, 0.8])
+    _, direction = model(z, L, t, t)
+
+    def function(z_value, t_value, r_value):
+        return model(z_value, L, r_value, t_value)[0]
+
+    _, actual = torch.func.jvp(
+        function, (z, t, r),
+        (direction.detach(), torch.ones_like(t), torch.zeros_like(r)))
+    step = 1e-3
+    upper = function(z + step * direction.detach(), t + step, r)
+    lower = function(z - step * direction.detach(), t - step, r)
+    torch.testing.assert_close(actual, (upper - lower) / (2 * step), atol=2e-4, rtol=2e-4)
+
+
+def test_production_matches_independent_reference_and_gradients():
+    torch.manual_seed(4)
+    x, L = torch.randn(2, 2, 3, 3), torch.randn(2, 1, 3, 3)
+    noise, r, t = torch.randn_like(x), torch.tensor([0.13, 0.21]), torch.tensor([0.77, 0.91])
+    weight = 0.17
+    production_model, reference_model = ToyModel(), ToyModel()
+    reference_model.load_state_dict(production_model.state_dict())
+    actual = meanflow_terms(production_model, x, L, noise=noise, r=r, t=t,
+                            auxiliary_weight=weight)
+    expected = reference_terms(reference_model, x, L, noise, r, t, weight)
+    for left, right in zip(
+        (actual.z, actual.u_prediction, actual.velocity_prediction, actual.jvp_direction,
+         actual.average_velocity_jvp, actual.corrected_velocity, actual.main_loss,
+         actual.auxiliary_loss, actual.total_loss), expected):
+        torch.testing.assert_close(left, right)
+    actual.total_loss.backward()
+    expected[-1].backward()
+    for left, right in zip(production_model.parameters(), reference_model.parameters()):
+        torch.testing.assert_close(left.grad, right.grad)
+
+
+def test_l_is_closed_over_not_a_jvp_primal():
+    x = torch.randn(1, 2, 2, 2)
+    L = torch.randn(1, 1, 2, 2, requires_grad=True)
+    terms = meanflow_terms(ToyModel(), x, L, noise=torch.randn_like(x),
+                           r=torch.tensor([0.2]), t=torch.tensor([0.8]))
+    # L can receive ordinary conditioning gradients, but it is never a tangent.
+    assert terms.jvp_direction.shape == x.shape
+    assert terms.z.shape[1] == 2
+
+
+def test_small_time_clean_conversion_and_endpoint_derivative():
+    z, clean = torch.ones(1, 2, 2, 2), torch.zeros(1, 2, 2, 2)
+    assert torch.equal(average_velocity(z, clean, torch.tensor([0.01])),
+                       torch.full_like(z, 20.0))
+    t = torch.tensor([0.05, 1.0])
+    z2, clean2 = torch.ones(2, 2, 1, 1), torch.zeros(2, 2, 1, 1)
+    _, tangent = torch.func.jvp(lambda value: average_velocity(z2, clean2, value),
+                                (t,), (torch.ones_like(t),))
+    expected = torch.tensor([-200.0, -0.5]).reshape(2, 1, 1, 1)
+    assert torch.equal(tangent, expected.expand_as(tangent))

@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from src.model import PMFTiny
+from src.model import PixelMeanFlowB
 
 
 class SamplingTests(unittest.TestCase):
@@ -23,9 +23,11 @@ class SamplingTests(unittest.TestCase):
         ).permute(0, 3, 1, 4, 2, 5).reshape_as(value)
 
     def test_joint_patch_permutation_changes_position_aware_output(self):
-        model = PMFTiny(
-            resolution=16, patch_size=4, hidden_size=32, depth=1, heads=4
+        model = PixelMeanFlowB(
+            resolution=16, patch_size=4, hidden_size=32, depth=2, heads=4,
+            aux_head_depth=1, pca_channels=8
         ).eval()
+        torch.nn.init.normal_(model.u_final_layer.linear._flax_linear.weight, std=0.02)
         z = torch.randn(1, 2, 16, 16)
         L = torch.randn(1, 1, 16, 16)
         permutation = torch.tensor([1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
@@ -40,9 +42,11 @@ class SamplingTests(unittest.TestCase):
         self.assertFalse(torch.allclose(original, restored, atol=1e-6, rtol=1e-6))
 
     def test_one_step_and_reproducibility(self):
-        model = PMFTiny(
-            resolution=16, patch_size=4, hidden_size=32, depth=1, heads=4
+        model = PixelMeanFlowB(
+            resolution=16, patch_size=4, hidden_size=32, depth=2, heads=4,
+            aux_head_depth=1, pca_channels=8
         ).eval()
+        torch.nn.init.normal_(model.u_final_layer.linear._flax_linear.weight, std=0.02)
         L = torch.zeros(1, 1, 16, 16)
         first = model.sample(L, seed=42, image_ids=["image-a"])
         second = model.sample(L, seed=42, image_ids=["image-a"])
@@ -52,9 +56,11 @@ class SamplingTests(unittest.TestCase):
         self.assertFalse(torch.equal(first, other))
 
     def test_seed_batch_matches_individual_sampling(self):
-        model = PMFTiny(
-            resolution=16, patch_size=4, hidden_size=32, depth=1, heads=4
+        model = PixelMeanFlowB(
+            resolution=16, patch_size=4, hidden_size=32, depth=2, heads=4,
+            aux_head_depth=1, pca_channels=8
         ).eval()
+        torch.nn.init.normal_(model.u_final_layer.linear._flax_linear.weight, std=0.02)
         L = torch.zeros(1, 1, 16, 16)
         batched = model.sample(L, seeds=[1, 2, 3, 4], image_ids=["image-a"])
         individual = torch.cat(
@@ -67,8 +73,9 @@ class SamplingTests(unittest.TestCase):
         torch.testing.assert_close(batched, individual, rtol=1e-5, atol=1e-6)
 
     def test_sample_lab_keeps_luminance(self):
-        model = PMFTiny(
-            resolution=16, patch_size=4, hidden_size=32, depth=1, heads=4
+        model = PixelMeanFlowB(
+            resolution=16, patch_size=4, hidden_size=32, depth=2, heads=4,
+            aux_head_depth=1, pca_channels=8
         ).eval()
         L = torch.randn(1, 1, 16, 16)
         lab = model.sample_lab(L, seed=7, image_ids=["image-a"])

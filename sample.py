@@ -24,6 +24,11 @@ def main():
         action="store_true",
         help="use raw checkpoint weights even when EMA weights are available",
     )
+    parser.add_argument(
+        "--ema-variant",
+        default=None,
+        help="EDM half-life in kimg (500, 1000, or 2000); defaults to config",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as handle:
@@ -37,17 +42,30 @@ def main():
         weight_decay=config["training"]["weight_decay"],
         warmup_steps=config["training"]["warmup_steps"],
         auxiliary_weight=config["training"]["auxiliary_weight"],
-        ema_decay=(
-            checkpoint_ema.get("decay", ema_config.get("decay", 0.9999))
-            if ema_config.get("enabled", True)
-            else None
+        norm_p=config["training"].get("norm_p", 1.0),
+        norm_eps=config["training"].get("norm_eps", 0.01),
+        optimizer=config["training"].get("optimizer", "muon"),
+        adam_b2=config["training"].get("adam_b2", 0.95),
+        lr_schedule=config["training"].get("lr_schedule", "constant"),
+        ema_enabled=ema_config.get("enabled", True),
+        ema_type=checkpoint_ema.get(
+            "ema_type",
+            "fixed" if "shadow" in checkpoint_ema else ema_config.get("type", "edm"),
         ),
+        ema_half_lives_kimg=checkpoint_ema.get(
+            "half_lives_kimg", ema_config.get("half_lives_kimg", [500, 1000, 2000])
+        ),
+        ema_decay=checkpoint_ema.get("decay", ema_config.get("decay", 0.9999)),
         ema_update_after_step=checkpoint_ema.get(
             "update_after_step", ema_config.get("update_after_step", 0)
         ),
         ema_update_every=checkpoint_ema.get(
             "update_every", ema_config.get("update_every", 1)
         ),
+        ema_validation_variant=ema_config.get("validation_variant"),
+        # Loss networks are not needed or loaded during standalone inference.
+        lpips_enabled=False,
+        convnext_enabled=False,
     )
     state_dict = checkpoint.get("state_dict", checkpoint)
     module.load_state_dict(state_dict)
@@ -65,7 +83,8 @@ def main():
         )
     L, _ = rgb_to_lab(image)
     L = L.unsqueeze(0)
-    with module.ema_scope():
+    ema_variant = args.ema_variant or ema_config.get("validation_variant")
+    with module.ema_scope(ema_variant):
         generated = module.model.sample(L, seed=args.seed)
         rgb = lab_to_rgb(L, generated)[0]
     cv2.imwrite(args.output, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
@@ -73,4 +92,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

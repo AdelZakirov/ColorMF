@@ -2,11 +2,13 @@ seed: 1234
 
 model:
   resolution: [128, 128]
-  patch_size: 16
+  patch_size: 8
   hidden_size: 384
   depth: 12
   heads: 8
   mlp_ratio: 4.0
+  aux_head_depth: 8
+  pca_channels: 128
 
 data:
   # Prefer manifests for very large datasets. Each line is either:
@@ -31,6 +33,9 @@ training:
   max_steps: null
   accumulate_grad_batches: 1
   learning_rate: 0.001
+  optimizer: adamw
+  adam_b2: 0.999
+  lr_schedule: constant
   weight_decay: 0.0001
   warmup_steps: 1000
   auxiliary_weight: 1.0
@@ -55,6 +60,7 @@ training:
   sync_batchnorm: false
   ema:
     enabled: true
+    type: fixed
     decay: 0.9999
     update_after_step: 1000
     update_every: 1

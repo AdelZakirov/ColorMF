@@ -1,9 +1,15 @@
-"""A small conditional DiT-style transformer for Pixel MeanFlow."""
+"""Official pMF-B architecture adapted to conditional LAB colorization.
+
+The transformer follows Lyy-iiis/pMF's PyTorch inference branch at commit
+990e81a84249dbd68a128accef67eb95621d10b1. The sole model adaptation is a
+three-channel spatial input ``[z_ab, L]`` and two-channel ``ab`` heads.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import math
+from functools import partial
 from typing import Optional, Sequence, Tuple, Union
 
 import torch
@@ -11,343 +17,365 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .lab import compose_lab
-from .pmf import average_velocity
 
 
-def _sincos_positions(length: int, dimension: int) -> Tensor:
-    positions = torch.arange(length, dtype=torch.float32).reshape(-1, 1)
-    half = dimension // 2
-    if half == 0:
-        return torch.zeros(length, dimension)
-    frequencies = torch.exp(
-        -math.log(10_000.0)
-        * torch.arange(half, dtype=torch.float32)
-        / max(half, 1)
-    )
-    angles = positions * frequencies.reshape(1, -1)
-    embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)
-    if embedding.shape[-1] < dimension:
-        embedding = F.pad(embedding, (0, dimension - embedding.shape[-1]))
-    return embedding
+class TorchLinear(nn.Module):
+    """Linear layer with the initialization used by the official Flax port."""
 
-
-def _two_dimensional_position_embedding(
-    rows: int, columns: int, dimension: int
-) -> Tensor:
-    row_dimension = dimension // 2
-    column_dimension = dimension - row_dimension
-    row_embedding = _sincos_positions(rows, row_dimension)[:, None, :].expand(
-        rows, columns, row_dimension
-    )
-    column_embedding = _sincos_positions(columns, column_dimension)[None, :, :].expand(
-        rows, columns, column_dimension
-    )
-    return torch.cat([row_embedding, column_embedding], dim=-1).reshape(
-        1, rows * columns, dimension
-    )
-
-
-class ScalarFourierEmbedding(nn.Module):
-    def __init__(self, dim: int, max_period: int = 10_000):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 weight_init: str = "scaled_variance", init_constant: float = 1.0,
+                 bias_init: str = "zeros"):
         super().__init__()
-        half = dim // 2
-        frequencies = torch.exp(
-            -math.log(max_period)
-            * torch.arange(half, dtype=torch.float32)
-            / max(half, 1)
-        )
-        self.register_buffer("frequencies", frequencies, persistent=False)
-        self.dim = dim
-
-    def forward(self, value: Tensor) -> Tensor:
-        value = value.float().reshape(-1, 1)
-        angles = value * self.frequencies.reshape(1, -1)
-        embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)
-        if embedding.shape[-1] < self.dim:
-            embedding = F.pad(embedding, (0, self.dim - embedding.shape[-1]))
-        return embedding
-
-
-class TimeCondition(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.embedding = ScalarFourierEmbedding(dim)
-        self.projection = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.SiLU(),
-            nn.Linear(dim, dim),
-        )
-
-    def forward(self, r: Tensor, t: Tensor) -> Tensor:
-        return self.projection(self.embedding(t - r))
-
-
-class SelfAttention(nn.Module):
-    """Explicit attention avoids fused kernels that lack forward-mode AD."""
-
-    def __init__(self, dim: int, heads: int):
-        super().__init__()
-        if dim % heads:
-            raise ValueError("hidden size must be divisible by number of heads")
-        self.heads = heads
-        self.head_dim = dim // heads
-        self.scale = self.head_dim**-0.5
-        self.qkv = nn.Linear(dim, 3 * dim)
-        self.projection = nn.Linear(dim, dim)
+        if weight_init == "scaled_variance":
+            initializer = partial(nn.init.normal_, std=init_constant / math.sqrt(in_features))
+        elif weight_init == "zeros":
+            initializer = nn.init.zeros_
+        else:
+            raise ValueError(f"invalid weight_init: {weight_init}")
+        if bias_init != "zeros":
+            raise ValueError(f"invalid bias_init: {bias_init}")
+        self._flax_linear = nn.Linear(in_features, out_features, bias=bias)
+        initializer(self._flax_linear.weight)
+        if bias:
+            nn.init.zeros_(self._flax_linear.bias)
 
     def forward(self, x: Tensor) -> Tensor:
-        batch, tokens, dim = x.shape
-        qkv = self.qkv(x).reshape(
-            batch, tokens, 3, self.heads, self.head_dim
+        return self._flax_linear(x)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        output = x * torch.rsqrt(torch.square(x).mean(dim=-1, keepdim=True) + self.eps)
+        return output.to(x.dtype) * self.weight
+
+
+class SwiGLUMlp(nn.Module):
+    def __init__(self, in_features: int, hidden_features: int,
+                 weight_init: str = "scaled_variance", weight_init_constant: float = 1.0):
+        super().__init__()
+        kwargs = dict(bias=False, weight_init=weight_init, init_constant=weight_init_constant)
+        self.w1 = TorchLinear(in_features, hidden_features, **kwargs)
+        self.w3 = TorchLinear(in_features, hidden_features, **kwargs)
+        self.w2 = TorchLinear(hidden_features, in_features, **kwargs)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256,
+                 weight_init: str = "scaled_variance", init_constant: float = 1.0):
+        super().__init__()
+        self.frequency_embedding_size = frequency_embedding_size
+        kwargs = dict(out_features=hidden_size, bias=True, weight_init=weight_init,
+                      init_constant=init_constant, bias_init="zeros")
+        self.mlp = nn.Sequential(
+            TorchLinear(frequency_embedding_size, **kwargs), nn.SiLU(),
+            TorchLinear(hidden_size, **kwargs),
         )
-        q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        weights = scores.float().softmax(dim=-1).to(dtype=q.dtype)
-        attended = torch.matmul(weights, v)
-        attended = attended.transpose(1, 2).reshape(batch, tokens, dim)
-        return self.projection(attended)
+
+    @staticmethod
+    def timestep_embedding(t: Tensor, dim: int, max_period: int = 10_000) -> Tensor:
+        half = dim // 2
+        frequencies = torch.exp(-math.log(max_period) * torch.arange(
+            half, dtype=torch.float32, device=t.device) / half)
+        angles = t[:, None].float() * frequencies[None]
+        embedding = torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t: Tensor) -> Tensor:
+        return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
+
+
+class BottleneckPatchEmbedder(nn.Module):
+    """Two-stage patch embedder from official pMF."""
+
+    def __init__(self, input_size: int, initial_patch_size: int, pca_channels: int,
+                 in_channels: int, hidden_size: int, bias: bool = True):
+        super().__init__()
+        self.input_size = input_size
+        self.patch_size = (initial_patch_size, initial_patch_size)
+        self.grid_size = tuple(size // initial_patch_size for size in (input_size, input_size))
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        self.proj1 = nn.Conv2d(in_channels, pca_channels, kernel_size=self.patch_size,
+                               stride=self.patch_size, bias=bias)
+        self.proj2 = nn.Conv2d(pca_channels, hidden_size, kernel_size=1, bias=bias)
+        fan_in = initial_patch_size * initial_patch_size * in_channels
+        limit1 = math.sqrt(6.0 / (fan_in + pca_channels))
+        limit2 = math.sqrt(6.0 / (pca_channels + hidden_size))
+        nn.init.uniform_(self.proj1.weight, -limit1, limit1)
+        nn.init.uniform_(self.proj2.weight, -limit2, limit2)
+        if bias:
+            nn.init.zeros_(self.proj1.bias)
+            nn.init.zeros_(self.proj2.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch, _, height, width = x.shape
+        if height != self.input_size or width != self.input_size:
+            raise ValueError(f"expected {self.input_size}x{self.input_size}, got {height}x{width}")
+        x = self.proj2(self.proj1(x))
+        return x.permute(0, 2, 3, 1).reshape(batch, -1, x.shape[1])
+
+
+def precompute_rope_freqs(dim: int, seq_len: int, theta: float = 10_000.0) -> Tensor:
+    rotary_dim = dim // 2
+    side = math.isqrt(seq_len)
+    if side * side != seq_len:
+        raise ValueError("RoPE requires a square spatial token grid")
+    frequencies = 1.0 / (theta ** (
+        torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
+    positions = torch.arange(side, dtype=torch.float32)
+    axis = torch.einsum("i,j->ij", positions, frequencies)
+    grid = torch.cat([axis[:, None, :].tile(1, side, 1),
+                      axis[None, :, :].tile(side, 1, 1)], dim=-1)
+    return torch.complex(torch.cos(grid).reshape(seq_len, rotary_dim),
+                         torch.sin(grid).reshape(seq_len, rotary_dim))
+
+
+def apply_rotary_pos_emb(x: Tensor, rope_freqs: Tensor) -> Tensor:
+    """Apply 2-D RoPE only to trailing spatial tokens; preserve time tokens."""
+    spatial_tokens = rope_freqs.shape[0]
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2).contiguous())
+    prefix = x_complex[:, :-spatial_tokens]
+    spatial = x_complex[:, -spatial_tokens:] * rope_freqs[None, :, None, :]
+    return torch.view_as_real(torch.cat([prefix, spatial], dim=1)).flatten(-2).to(x.dtype)
+
+
+class RoPEAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int,
+                 weight_init: str = "scaled_variance", weight_init_constant: float = 1.0):
+        super().__init__()
+        if hidden_size % num_heads:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        kwargs = dict(in_features=hidden_size, out_features=hidden_size, bias=False,
+                      weight_init=weight_init, init_constant=weight_init_constant)
+        self.q_proj = TorchLinear(**kwargs)
+        self.k_proj = TorchLinear(**kwargs)
+        self.v_proj = TorchLinear(**kwargs)
+        self.out_proj = TorchLinear(**kwargs)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
+    def forward(self, x: Tensor, rope_freqs: Tensor) -> Tensor:
+        batch, sequence, _ = x.shape
+        shape = (batch, sequence, self.num_heads, self.head_dim)
+        q = apply_rotary_pos_emb(self.q_norm(self.q_proj(x).reshape(shape)), rope_freqs)
+        k = apply_rotary_pos_emb(self.k_norm(self.k_proj(x).reshape(shape)), rope_freqs)
+        v = self.v_proj(x).reshape(shape)
+        weights = torch.einsum("bqhd,bkhd->bhqk", q / math.sqrt(self.head_dim), k)
+        weights = F.softmax(weights, dim=-1, dtype=torch.float32).to(v.dtype)
+        attended = torch.einsum("bhqk,bkhd->bqhd", weights, v)
+        return self.out_proj(attended.reshape(batch, sequence, self.hidden_size))
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0):
+    """Official pMF block with zero-initialized vector residual gates."""
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 8 / 3,
+                 weight_init: str = "scaled_variance", weight_init_constant: float = 1.0):
         super().__init__()
-        hidden = int(dim * mlp_ratio)
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.attention = SelfAttention(dim, heads)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, dim),
-        )
-        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
-        nn.init.zeros_(self.modulation[-1].weight)
-        nn.init.zeros_(self.modulation[-1].bias)
+        self.norm1 = RMSNorm(hidden_size)
+        self.attn = RoPEAttention(hidden_size, num_heads, weight_init, weight_init_constant)
+        self.norm2 = RMSNorm(hidden_size)
+        mlp_hidden = int(hidden_size * mlp_ratio)
+        if hidden_size > 1024:
+            mlp_hidden = (mlp_hidden + 7) // 8 * 8
+        self.mlp = SwiGLUMlp(hidden_size, mlp_hidden, weight_init, weight_init_constant)
+        self.attn_scale = nn.Parameter(torch.zeros(hidden_size))
+        self.mlp_scale = nn.Parameter(torch.zeros(hidden_size))
 
-    @staticmethod
-    def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
-        return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-    def forward(self, x: Tensor, condition: Tensor) -> Tensor:
-        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation(condition).chunk(6, dim=-1)
-        )
-        x = x + gate_attn.unsqueeze(1) * self.attention(
-            self._modulate(self.norm1(x), shift_attn, scale_attn)
-        )
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            self._modulate(self.norm2(x), shift_mlp, scale_mlp)
-        )
-        return x
+    def forward(self, x: Tensor, rope_freqs: Tensor) -> Tensor:
+        x = x + self.attn(self.norm1(x), rope_freqs) * self.attn_scale
+        return x + self.mlp(self.norm2(x)) * self.mlp_scale
 
 
-class PatchEmbed(nn.Module):
-    def __init__(self, in_channels: int, dim: int, patch_size: int):
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
-        self.projection = nn.Conv2d(
-            in_channels, dim, kernel_size=patch_size, stride=patch_size
-        )
-        self.patch_size = patch_size
+        self.norm = RMSNorm(hidden_size)
+        self.linear = TorchLinear(hidden_size, patch_size * patch_size * out_channels,
+                                  bias=True, weight_init="zeros", bias_init="zeros")
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.projection(x).flatten(2).transpose(1, 2)
+        return self.linear(self.norm(x))
 
 
-class PMFTiny(nn.Module):
-    """pMF-Tiny with clean-x and auxiliary instantaneous-velocity heads."""
+class PixelMeanFlowB(nn.Module):
+    """pMF-B adapted from RGB generation to conditional ``p(ab | L)``."""
 
-    def __init__(
-        self,
-        *,
-        resolution: Union[int, Tuple[int, int]] = 256,
-        patch_size: int = 16,
-        hidden_size: int = 384,
-        depth: int = 12,
-        heads: int = 8,
-        mlp_ratio: float = 4.0,
-        in_channels: int = 3,
-        state_channels: int = 2,
-    ):
+    def __init__(self, *, resolution: Union[int, Tuple[int, int]] = 256,
+                 patch_size: int = 16, in_channels: int = 3, out_channels: int = 2,
+                 hidden_size: int = 768, depth: int = 16, num_heads: int = 12,
+                 heads: Optional[int] = None, mlp_ratio: float = 8 / 3,
+                 aux_head_depth: int = 8, pca_channels: int = 128,
+                 num_time_tokens: int = 4, token_init_constant: float = 1.0,
+                 embedding_init_constant: float = 1.0,
+                 weight_init_constant: float = 0.32):
         super().__init__()
-        if isinstance(resolution, int):
-            resolution = (resolution, resolution)
-        if any(size % patch_size for size in resolution):
+        if heads is not None:
+            num_heads = heads
+        if isinstance(resolution, (tuple, list)):
+            if resolution[0] != resolution[1]:
+                raise ValueError("official pMF RoPE requires square inputs")
+            resolution = resolution[0]
+        if resolution % patch_size:
             raise ValueError("resolution must be divisible by patch_size")
-        if in_channels != 3 or state_channels != 2:
-            raise ValueError("PMFTiny expects [z_a, z_b, L] and predicts [a, b]")
-        self.resolution = tuple(resolution)
+        if in_channels != 3 or out_channels != 2:
+            raise ValueError("conditional pMF expects [z_ab,L] input and ab output")
+        if not 0 < aux_head_depth < depth:
+            raise ValueError("aux_head_depth must leave at least one shared block")
+        self.resolution = (resolution, resolution)
+        self.input_size = resolution
         self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.state_channels = out_channels
         self.hidden_size = hidden_size
-        self.state_channels = state_channels
-        self.patch_rows = resolution[0] // patch_size
-        self.patch_cols = resolution[1] // patch_size
-        self.patch_area = patch_size * patch_size
-
-        self.patch_embed = PatchEmbed(in_channels, hidden_size, patch_size)
-        self.register_buffer(
-            "position_embedding",
-            _two_dimensional_position_embedding(
-                self.patch_rows, self.patch_cols, hidden_size
-            ),
-            persistent=False,
-        )
-        self.time_condition = TimeCondition(hidden_size)
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(hidden_size, heads, mlp_ratio) for _ in range(depth)]
-        )
-        self.final_norm = nn.LayerNorm(hidden_size)
-        output_dim = state_channels * self.patch_area
-        self.clean_head = nn.Linear(hidden_size, output_dim)
-        self.velocity_head = nn.Linear(hidden_size, output_dim)
-        nn.init.normal_(self.clean_head.weight, std=0.02)
-        nn.init.zeros_(self.clean_head.bias)
-        nn.init.normal_(self.velocity_head.weight, std=0.02)
-        nn.init.zeros_(self.velocity_head.bias)
+        self.depth = depth
+        self.num_heads = num_heads
+        self.aux_head_depth = aux_head_depth
+        self.num_time_tokens = num_time_tokens
+        self.x_embedder = BottleneckPatchEmbedder(
+            resolution, patch_size, pca_channels, in_channels, hidden_size, bias=True)
+        self.h_embedder = TimestepEmbedder(
+            hidden_size, weight_init="scaled_variance", init_constant=embedding_init_constant)
+        token_initializer = partial(nn.init.normal_,
+                                    std=token_init_constant / math.sqrt(hidden_size))
+        self.time_tokens = nn.Parameter(token_initializer(
+            torch.empty(1, num_time_tokens, hidden_size)))
+        self.prefix_tokens = num_time_tokens
+        self.pos_embed = nn.Parameter(nn.init.normal_(torch.empty(
+            1, self.x_embedder.num_patches + num_time_tokens, hidden_size), std=0.02))
+        self.register_buffer("rope_freqs", precompute_rope_freqs(
+            hidden_size // num_heads, self.x_embedder.num_patches), persistent=False)
+        block_kwargs = dict(hidden_size=hidden_size, num_heads=num_heads,
+                            mlp_ratio=mlp_ratio, weight_init="scaled_variance",
+                            weight_init_constant=weight_init_constant)
+        self.shared_blocks = nn.ModuleList([TransformerBlock(**block_kwargs)
+                                            for _ in range(depth - aux_head_depth)])
+        self.u_blocks = nn.ModuleList([TransformerBlock(**block_kwargs)
+                                       for _ in range(aux_head_depth)])
+        self.v_blocks = nn.ModuleList([TransformerBlock(**block_kwargs)
+                                       for _ in range(aux_head_depth)])
+        self.u_final_layer = FinalLayer(hidden_size, patch_size, out_channels)
+        self.v_final_layer = FinalLayer(hidden_size, patch_size, out_channels)
         self.main_model_evaluations = 0
         self.last_sample_nfe = 0
 
+    @property
+    def num_spatial_tokens(self) -> int:
+        return self.x_embedder.num_patches
+
     def _unpatchify(self, tokens: Tensor) -> Tensor:
-        batch = tokens.shape[0]
-        tokens = tokens.reshape(
-            batch,
-            self.patch_rows,
-            self.patch_cols,
-            self.patch_size,
-            self.patch_size,
-            self.state_channels,
-        )
-        tokens = tokens.permute(0, 5, 1, 3, 2, 4)
-        return tokens.reshape(
-            batch,
-            self.state_channels,
-            self.patch_rows * self.patch_size,
-            self.patch_cols * self.patch_size,
-        )
+        side = math.isqrt(tokens.shape[1])
+        if side * side != tokens.shape[1]:
+            raise ValueError("spatial token count must be square")
+        p = self.patch_size
+        tokens = tokens.reshape(tokens.shape[0], side, side, p, p, self.out_channels)
+        tokens = torch.einsum("nhwpqc->nchpwq", tokens)
+        return tokens.reshape(tokens.shape[0], self.out_channels, side * p, side * p)
 
-    def forward(
-        self,
-        z: Tensor,
-        L: Tensor,
-        r: Tensor,
-        t: Tensor,
-        *,
-        return_velocity: bool = True,
-    ):
+    @staticmethod
+    def _velocity(z: Tensor, clean: Tensor, t: Tensor) -> Tensor:
+        value = t.float()
+        denominator = torch.minimum(torch.maximum(value, value.new_tensor(0.05)),
+                                    value.new_tensor(1.0)).reshape(-1, 1, 1, 1)
+        return (z.float() - clean.float()) / denominator
+
+    def _sequence(self, z: Tensor, L: Tensor, h: Tensor) -> Tensor:
         if z.ndim != 4 or z.shape[1] != 2:
-            raise ValueError("z must be [B,2,H,W]; L is not part of the state")
-        if L.ndim != 4 or L.shape[1] != 1 or L.shape[0] != z.shape[0]:
+            raise ValueError("z must be [B,2,H,W]; L is not stochastic state")
+        if L.shape != (z.shape[0], 1, *z.shape[-2:]):
             raise ValueError("L must be [B,1,H,W] and match z")
-        if z.shape[-2:] != self.resolution or L.shape[-2:] != self.resolution:
-            raise ValueError(f"expected spatial resolution {self.resolution}")
-        hidden = self.patch_embed(torch.cat([z, L], dim=1))
-        hidden = hidden + self.position_embedding.to(
-            device=hidden.device, dtype=hidden.dtype
-        )
-        condition = self.time_condition(r, t)
-        for block in self.blocks:
-            hidden = block(hidden, condition)
-        hidden = self.final_norm(hidden)
-        clean = self._unpatchify(self.clean_head(hidden))
+        if z.shape[-2:] != self.resolution:
+            raise ValueError(f"expected resolution {self.resolution}")
+        spatial = self.x_embedder(torch.cat([z, L], dim=1))
+        time = self.time_tokens + self.h_embedder(h)[:, None]
+        return torch.cat([time, spatial], dim=1) + self.pos_embed
+
+    def forward(self, z: Tensor, L: Tensor, r: Tensor, t: Tensor, *,
+                return_velocity: bool = True) -> tuple[Tensor, Optional[Tensor]]:
+        sequence = self._sequence(z, L, t - r)
+        for block in self.shared_blocks:
+            sequence = block(sequence, self.rope_freqs)
+        u_sequence = sequence
+        for block in self.u_blocks:
+            u_sequence = block(u_sequence, self.rope_freqs)
+        u_clean = self._unpatchify(self.u_final_layer(
+            u_sequence[:, self.prefix_tokens:]))
+        u = self._velocity(z, u_clean, t)
         if not return_velocity:
-            return clean, None
-        velocity_head = self._unpatchify(self.velocity_head(hidden))
-        velocity = average_velocity(z, velocity_head, t)
-        return clean, velocity
-
-    @property
-    def total_training_parameters(self) -> int:
-        return sum(parameter.numel() for parameter in self.parameters())
-
-    @property
-    def auxiliary_v_head_parameters(self) -> int:
-        return sum(parameter.numel() for parameter in self.velocity_head.parameters())
-
-    @property
-    def inference_required_parameters(self) -> int:
-        return self.total_training_parameters - self.auxiliary_v_head_parameters
-
-    def parameter_report(self) -> dict:
-        return {
-            "total_training_parameters": self.total_training_parameters,
-            "inference_required_parameters": self.inference_required_parameters,
-            "auxiliary_v_head_parameters": self.auxiliary_v_head_parameters,
-        }
+            return u, None
+        v_sequence = sequence
+        for block in self.v_blocks:
+            v_sequence = block(v_sequence, self.rope_freqs)
+        v_clean = self._unpatchify(self.v_final_layer(
+            v_sequence[:, self.prefix_tokens:]))
+        return u, self._velocity(z, v_clean, t)
 
     @staticmethod
     def _stable_seed(image_id: str, seed: int) -> int:
-        digest = hashlib.sha256(f"{image_id}|{seed}".encode("utf-8")).digest()
-        return int.from_bytes(digest[:8], byteorder="little") % (2**63 - 1)
+        digest = hashlib.sha256(f"{image_id}|{seed}".encode()).digest()
+        return int.from_bytes(digest[:8], "little") % (2**63 - 1)
 
     @torch.no_grad()
-    def sample(
-        self,
-        L: Tensor,
-        *,
-        seed: Optional[int] = None,
-        seeds: Optional[Sequence[int]] = None,
-        image_ids: Optional[Sequence[str]] = None,
-    ) -> Tensor:
-        """Generate chroma in one main network evaluation.
-
-        With a single input image, a sequence of seeds returns one sample per
-        seed.  Per-example noise is generated independently on CPU so changing
-        batch size or DDP rank does not change a sample's random stream. Network
-        arithmetic may still vary slightly with CUDA batching and precision.
-        """
-
+    def sample(self, L: Tensor, *, seed: Optional[int] = None,
+               seeds: Optional[Sequence[int]] = None,
+               image_ids: Optional[Sequence[str]] = None) -> Tensor:
         if seed is None and seeds is None:
             seed = 0
         if seed is not None and seeds is not None:
             raise ValueError("pass either seed or seeds, not both")
-        batch = L.shape[0]
-        if seeds is None:
-            requested_seeds = [int(seed)] * batch
-        else:
-            requested_seeds = [int(value) for value in seeds]
-            if batch != 1 and len(requested_seeds) != batch:
-                raise ValueError("seeds must match batch size unless L has batch one")
-            if batch == 1:
-                L = L.expand(len(requested_seeds), -1, -1, -1)
-        if image_ids is None:
-            ids = [str(index) for index in range(L.shape[0])]
-        else:
-            if len(image_ids) != batch:
-                raise ValueError("image_ids must match the original L batch")
-            ids = list(image_ids)
-            if batch == 1 and len(requested_seeds) > 1:
-                ids = ids * len(requested_seeds)
-        if len(ids) != len(requested_seeds):
-            raise ValueError("seed and image_id expansion did not match")
-
+        original_batch = L.shape[0]
+        requested = [int(seed)] * original_batch if seeds is None else [int(x) for x in seeds]
+        if original_batch == 1 and len(requested) > 1:
+            L = L.expand(len(requested), -1, -1, -1)
+        elif len(requested) != original_batch:
+            raise ValueError("seeds must match batch size unless L has batch one")
+        ids = [str(i) for i in range(original_batch)] if image_ids is None else list(image_ids)
+        if len(ids) != original_batch:
+            raise ValueError("image_ids must match the original L batch")
+        if original_batch == 1 and len(requested) > 1:
+            ids *= len(requested)
         noise = []
-        for index, requested_seed in enumerate(requested_seeds):
+        for image_id, requested_seed in zip(ids, requested):
             generator = torch.Generator(device="cpu")
-            generator.manual_seed(self._stable_seed(ids[index], requested_seed))
-            noise.append(
-                torch.randn(
-                    (1, self.state_channels, *self.resolution),
-                    generator=generator,
-                    dtype=torch.float32,
-                )
-            )
-        z = torch.cat(noise, dim=0).to(device=L.device, dtype=L.dtype)
-        r = torch.zeros(L.shape[0], device=L.device, dtype=L.dtype)
-        t = torch.ones(L.shape[0], device=L.device, dtype=L.dtype)
-        clean, _ = self(z, L, r, t, return_velocity=False)
-        one_step_velocity = average_velocity(z, clean, t)
-        generated = z - (t - r).reshape(-1, 1, 1, 1) * one_step_velocity
+            generator.manual_seed(self._stable_seed(image_id, requested_seed))
+            noise.append(torch.randn((1, 2, *self.resolution), generator=generator))
+        z_t = torch.cat(noise).to(device=L.device, dtype=L.dtype)
+        t = torch.ones(z_t.shape[0], device=L.device, dtype=L.dtype)
+        r = torch.zeros_like(t)
+        u, _ = self(z_t, L, r, t, return_velocity=False)
         self.last_sample_nfe = 1
         self.main_model_evaluations += 1
-        return generated
+        return z_t - (t - r).reshape(-1, 1, 1, 1) * u
 
     @torch.no_grad()
     def sample_lab(self, L: Tensor, **kwargs) -> Tensor:
-        """Return ``[L_original, sampled_ab]`` without modifying luminance."""
-
         ab = self.sample(L, **kwargs)
         if ab.shape[0] != L.shape[0]:
             L = L.expand(ab.shape[0], -1, -1, -1)
         return compose_lab(L, ab)
+
+    @staticmethod
+    def _count(modules) -> int:
+        return sum(parameter.numel() for module in modules
+                   for parameter in module.parameters())
+
+    def parameter_report(self) -> dict[str, int]:
+        shared = self._count([self.x_embedder, self.h_embedder, self.shared_blocks])
+        shared += self.time_tokens.numel() + self.pos_embed.numel()
+        u = self._count([self.u_blocks, self.u_final_layer])
+        v = self._count([self.v_blocks, self.v_final_layer])
+        return {"total_training_parameters": sum(p.numel() for p in self.parameters()),
+                "shared_parameters": shared, "u_head_parameters": u,
+                "v_head_parameters": v, "inference_required_parameters": shared + u}

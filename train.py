@@ -128,7 +128,12 @@ def main():
         weight_decay=training["weight_decay"],
         warmup_steps=training["warmup_steps"],
         max_steps=training.get("max_steps"),
+        optimizer=training.get("optimizer", "muon"),
+        adam_b2=training.get("adam_b2", 0.95),
+        lr_schedule=training.get("lr_schedule", "constant"),
         auxiliary_weight=training["auxiliary_weight"],
+        norm_p=training.get("norm_p", 1.0),
+        norm_eps=training.get("norm_eps", 0.01),
         time_p_mean=time_sampling.get("p_mean", 0.8),
         time_p_std=time_sampling.get("p_std", 0.8),
         time_data_proportion=time_sampling.get("data_proportion", 0.5),
@@ -138,10 +143,19 @@ def main():
         fixed_validation_ids=validation.get("image_ids", []),
         validation_image_count=validation.get("image_count", 4),
         validation_sample_seeds=validation.get("sample_seeds"),
-        ema_decay=ema.get("decay") if ema.get("enabled", True) else None,
+        ema_enabled=ema.get("enabled", True),
+        ema_type=ema.get("type", "edm"),
+        ema_half_lives_kimg=ema.get("half_lives_kimg", [500, 1000, 2000]),
+        ema_decay=ema.get("decay", 0.9999),
         ema_update_after_step=ema.get("update_after_step", 0),
         ema_update_every=ema.get("update_every", 1),
         ema_use_for_validation=ema.get("use_for_validation", True),
+        ema_validation_variant=ema.get("validation_variant"),
+        lpips_enabled=training.get("perceptual", {}).get("lpips", {}).get("enabled", False),
+        lpips_weight=training.get("perceptual", {}).get("lpips", {}).get("weight", 0.4),
+        convnext_enabled=training.get("perceptual", {}).get("convnext", {}).get("enabled", False),
+        convnext_weight=training.get("perceptual", {}).get("convnext", {}).get("weight", 0.1),
+        perceptual_max_t=training.get("perceptual", {}).get("max_t", 0.8),
         sample_dir=training.get("sample_dir", "qualitative"),
     )
     datamodule = PaletteDataModule(**data)
@@ -171,6 +185,9 @@ def main():
         logger=build_logger(training),
         sync_batchnorm=training.get("sync_batchnorm", False),
         use_distributed_sampler=True,
+        # Forward-mode AD used by the pMF validation JVP is disabled by
+        # torch.inference_mode; Lightning's no-grad validation is sufficient.
+        inference_mode=False,
     )
     if trainer.logger is not None:
         trainer.logger.log_hyperparams(config)

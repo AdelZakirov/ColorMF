@@ -58,9 +58,11 @@ def test_local_mlflow_logs_run_data_and_artifact(tmp_path: Path):
             "resolution": [16, 16],
             "patch_size": 8,
             "hidden_size": 16,
-            "depth": 1,
-            "heads": 4,
-            "mlp_ratio": 2.0,
+                "depth": 2,
+                "heads": 4,
+                "mlp_ratio": 2.0,
+                "aux_head_depth": 1,
+                "pca_channels": 8,
         }
     )
     logger.log_hyperparams(config)

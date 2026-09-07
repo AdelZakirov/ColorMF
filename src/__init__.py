@@ -8,10 +8,10 @@ from .lab import (
     normalize_ab,
     rgb_to_lab,
 )
-from .model import PMFTiny
+from .model import PixelMeanFlowB
 
 __all__ = [
-    "PMFTiny",
+    "PixelMeanFlowB",
     "denormalize_L",
     "denormalize_ab",
     "lab_to_rgb",

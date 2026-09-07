@@ -65,7 +65,8 @@ class PaletteDataset(Dataset):
         manifest: Optional[str] = None,
         size: Tuple[int, int] = (256, 256),
         train: bool = False,
-        horizontal_flip: bool = True,
+        horizontal_flip: bool = False,
+        resize_strategy: str = "center_crop",
     ):
         if (paths is None) == (manifest is None):
             raise ValueError("provide exactly one of paths or manifest")
@@ -73,6 +74,7 @@ class PaletteDataset(Dataset):
         self.size = tuple(size)
         self.train = train
         self.horizontal_flip = horizontal_flip
+        self.resize_strategy = resize_strategy
 
     def __len__(self) -> int:
         return len(self.items)
@@ -93,9 +95,23 @@ class PaletteDataset(Dataset):
             raise FileNotFoundError(f"could not decode image: {path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         target_height, target_width = self.size
-        image = cv2.resize(
-            image, (target_width, target_height), interpolation=cv2.INTER_CUBIC
-        )
+        if self.resize_strategy == "center_crop":
+            # Official pMF uses ADM-style aspect-preserving resize + center crop.
+            scale = max(target_height / image.shape[0], target_width / image.shape[1])
+            resized = cv2.resize(
+                image,
+                (round(image.shape[1] * scale), round(image.shape[0] * scale)),
+                interpolation=cv2.INTER_CUBIC,
+            )
+            top = (resized.shape[0] - target_height) // 2
+            left = (resized.shape[1] - target_width) // 2
+            image = resized[top : top + target_height, left : left + target_width]
+        elif self.resize_strategy == "stretch":
+            image = cv2.resize(
+                image, (target_width, target_height), interpolation=cv2.INTER_CUBIC
+            )
+        else:
+            raise ValueError("resize_strategy must be 'center_crop' or explicit legacy 'stretch'")
         if self.train and self.horizontal_flip and random.random() < 0.5:
             image = image[:, ::-1].copy()
         L, ab = rgb_to_lab(image)
@@ -123,7 +139,8 @@ class PaletteDataModule(pl.LightningDataModule):
         batch_size: int = 8,
         val_batch_size: int = 4,
         num_workers: int = 4,
-        horizontal_flip: bool = True,
+        horizontal_flip: bool = False,
+        resize_strategy: str = "center_crop",
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -144,6 +161,7 @@ class PaletteDataModule(pl.LightningDataModule):
         common = {
             "size": tuple(self.hparams.resolution),
             "horizontal_flip": self.hparams.horizontal_flip,
+            "resize_strategy": self.hparams.resize_strategy,
         }
         self.train_dataset = PaletteDataset(**train_kwargs, train=True, **common)
         self.val_dataset = PaletteDataset(**val_kwargs, train=False, **common)

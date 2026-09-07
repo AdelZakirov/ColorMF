@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence
@@ -15,8 +14,10 @@ from pytorch_lightning.loggers import MLFlowLogger
 from PIL import Image, ImageDraw
 
 from .lab import lab_to_rgb
-from .ema import ExponentialMovingAverage
-from .model import PMFTiny
+from .ema import EMAManager
+from .model import PixelMeanFlowB
+from .optimizer import Muon
+from .perceptual import PerceptualLosses
 from .pmf import meanflow_terms
 
 
@@ -62,11 +63,16 @@ class PMFColorizerModule(pl.LightningModule):
         self,
         *,
         model: Optional[dict] = None,
-        learning_rate: float = 2.0e-4,
-        weight_decay: float = 1.0e-4,
-        warmup_steps: int = 1_000,
+        learning_rate: float = 1.0e-3,
+        weight_decay: float = 0.0,
+        warmup_steps: int = 0,
         max_steps: Optional[int] = None,
+        optimizer: str = "muon",
+        adam_b2: float = 0.95,
+        lr_schedule: str = "constant",
         auxiliary_weight: float = 1.0,
+        norm_p: float = 1.0,
+        norm_eps: float = 0.01,
         time_p_mean: float = 0.8,
         time_p_std: float = 0.8,
         time_data_proportion: float = 0.5,
@@ -76,19 +82,33 @@ class PMFColorizerModule(pl.LightningModule):
         fixed_validation_ids: Optional[Iterable[str]] = None,
         validation_image_count: int = 4,
         validation_sample_seeds: Optional[Sequence[int]] = None,
+        ema_enabled: bool = True,
+        ema_type: str = "edm",
+        ema_half_lives_kimg: Sequence[float] = (500, 1000, 2000),
         ema_decay: Optional[float] = 0.9999,
         ema_update_after_step: int = 0,
         ema_update_every: int = 1,
         ema_use_for_validation: bool = True,
+        ema_validation_variant: Optional[str] = None,
+        lpips_enabled: bool = False,
+        lpips_weight: float = 0.4,
+        convnext_enabled: bool = False,
+        convnext_weight: float = 0.1,
+        perceptual_max_t: float = 0.8,
         sample_dir: str = "qualitative",
     ):
         super().__init__()
         model_config = model or {}
         self.save_hyperparameters()
-        self.model = PMFTiny(**model_config)
+        self.model = PixelMeanFlowB(**model_config)
         self.auxiliary_weight = auxiliary_weight
+        self.norm_p = norm_p
+        self.norm_eps = norm_eps
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
+        self.optimizer_name = optimizer.lower()
+        self.adam_b2 = adam_b2
+        self.lr_schedule = lr_schedule
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.time_p_mean = time_p_mean
@@ -108,18 +128,32 @@ class PMFColorizerModule(pl.LightningModule):
         if not self.validation_sample_seeds:
             raise ValueError("validation_sample_seeds must not be empty")
         self.ema_decay = ema_decay
+        self.ema_type = ema_type
+        self.ema_half_lives_kimg = tuple(ema_half_lives_kimg)
         self.ema_update_after_step = int(ema_update_after_step)
         self.ema_update_every = int(ema_update_every)
         self.ema = (
-            ExponentialMovingAverage(
-                decay=ema_decay,
+            EMAManager(
+                ema_type=ema_type,
+                half_lives_kimg=self.ema_half_lives_kimg,
+                decay=0.9999 if ema_decay is None else ema_decay,
                 update_after_step=self.ema_update_after_step,
                 update_every=self.ema_update_every,
             )
-            if ema_decay is not None
+            if ema_enabled
             else None
         )
         self.ema_use_for_validation = ema_use_for_validation
+        self.ema_validation_variant = (
+            str(ema_validation_variant) if ema_validation_variant is not None
+            else (self.ema.variants[0] if self.ema is not None else None)
+        )
+        self.lpips_enabled = lpips_enabled
+        self.lpips_weight = lpips_weight
+        self.convnext_enabled = convnext_enabled
+        self.convnext_weight = convnext_weight
+        self.perceptual_max_t = perceptual_max_t
+        self._perceptual_losses: Optional[PerceptualLosses] = None
         self._pending_ema_state: Optional[dict] = None
         self._ema_validation_applied = False
         self.sample_dir = sample_dir
@@ -129,6 +163,14 @@ class PMFColorizerModule(pl.LightningModule):
         self._validation_generator: Optional[torch.Generator] = None
         self._pending_train_generator_state: Optional[torch.Tensor] = None
         self._train_batch_started_at: Optional[float] = None
+        self._ema_images_pending = 0
+
+    def on_fit_start(self):
+        if self.lpips_enabled or self.convnext_enabled:
+            self._perceptual_losses = PerceptualLosses(
+                use_lpips=self.lpips_enabled,
+                use_convnext=self.convnext_enabled,
+            ).to(self.device)
 
     def forward(self, z, L, r, t, *, return_velocity: bool = True):
         return self.model(z, L, r, t, return_velocity=return_velocity)
@@ -152,14 +194,22 @@ class PMFColorizerModule(pl.LightningModule):
             batch["ab"],
             batch["L"],
             auxiliary_weight=self.auxiliary_weight,
+            adaptive_power=self.norm_p,
+            adaptive_epsilon=self.norm_eps,
             generator=self._train_generator,
             p_mean=self.time_p_mean,
             p_std=self.time_p_std,
             data_proportion=self.time_data_proportion,
             tr_uniform=self.time_tr_uniform,
             uniform_probability=self.time_uniform_probability,
+            perceptual_fn=self._perceptual_losses,
+            lpips_weight=self.lpips_weight if self.lpips_enabled else 0.0,
+            convnext_weight=self.convnext_weight if self.convnext_enabled else 0.0,
+            perceptual_max_t=self.perceptual_max_t,
         )
         batch_size = batch["ab"].shape[0]
+        world_size = int(getattr(self.trainer, "world_size", 1))
+        self._ema_images_pending += batch_size * world_size
         self.log(
             "train/pMF_loss",
             terms.main_loss,
@@ -184,6 +234,12 @@ class PMFColorizerModule(pl.LightningModule):
             sync_dist=True,
             batch_size=batch_size,
         )
+        if self.lpips_enabled:
+            self.log("train/lpips_loss", terms.perceptual_lpips_loss,
+                     on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        if self.convnext_enabled:
+            self.log("train/convnext_loss", terms.perceptual_convnext_loss,
+                     on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
         self.log(
             "train/raw_main_velocity_mse",
             terms.main_velocity_mse_per_example.mean(),
@@ -276,7 +332,7 @@ class PMFColorizerModule(pl.LightningModule):
             and self.ema.ready
         ):
             self.ema.store(self.model)
-            self.ema.copy_to(self.model)
+            self.ema.copy_to(self.model, self.ema_validation_variant)
             self._ema_validation_applied = True
         self._validation_generator = torch.Generator(device=self.device)
         self._validation_generator.manual_seed(
@@ -289,12 +345,18 @@ class PMFColorizerModule(pl.LightningModule):
             batch["ab"],
             batch["L"],
             auxiliary_weight=self.auxiliary_weight,
+            adaptive_power=self.norm_p,
+            adaptive_epsilon=self.norm_eps,
             generator=self._validation_generator,
             p_mean=self.time_p_mean,
             p_std=self.time_p_std,
             data_proportion=self.time_data_proportion,
             tr_uniform=self.time_tr_uniform,
             uniform_probability=self.time_uniform_probability,
+            perceptual_fn=self._perceptual_losses,
+            lpips_weight=self.lpips_weight if self.lpips_enabled else 0.0,
+            convnext_weight=self.convnext_weight if self.convnext_enabled else 0.0,
+            perceptual_max_t=self.perceptual_max_t,
         )
         for index, image_id in enumerate(batch["image_id"]):
             image_id = str(image_id)
@@ -436,26 +498,30 @@ class PMFColorizerModule(pl.LightningModule):
         self._pending_train_generator_state = checkpoint.get("train_generator_state")
         self._pending_ema_state = checkpoint.get("ema")
         saved_hyperparameters = checkpoint.get("hyper_parameters", {})
-        protected_keys = (
-            "learning_rate",
-            "weight_decay",
-            "warmup_steps",
-            "max_steps",
-            "auxiliary_weight",
-            "time_p_mean",
-            "time_p_std",
-            "time_data_proportion",
-            "time_tr_uniform",
-            "time_uniform_probability",
-            "random_seed",
-            "ema_decay",
-            "ema_update_after_step",
-            "ema_update_every",
-        )
-        for key in protected_keys:
-            if key in saved_hyperparameters and saved_hyperparameters[key] != getattr(
-                self, key
-            ):
+        protected = {
+            "learning_rate": "learning_rate", "weight_decay": "weight_decay",
+            "warmup_steps": "warmup_steps", "max_steps": "max_steps",
+            "optimizer": "optimizer_name", "adam_b2": "adam_b2",
+            "lr_schedule": "lr_schedule", "auxiliary_weight": "auxiliary_weight",
+            "norm_p": "norm_p", "norm_eps": "norm_eps",
+            "time_p_mean": "time_p_mean", "time_p_std": "time_p_std",
+            "time_data_proportion": "time_data_proportion",
+            "time_tr_uniform": "time_tr_uniform",
+            "time_uniform_probability": "time_uniform_probability",
+            "random_seed": "random_seed", "ema_decay": "ema_decay",
+            "ema_type": "ema_type", "ema_half_lives_kimg": "ema_half_lives_kimg",
+            "ema_update_after_step": "ema_update_after_step",
+            "ema_update_every": "ema_update_every",
+        }
+        for key, attribute in protected.items():
+            if key not in saved_hyperparameters:
+                continue
+            saved, current = saved_hyperparameters[key], getattr(self, attribute)
+            if key == "ema_half_lives_kimg":
+                saved, current = tuple(saved), tuple(current)
+            if key == "optimizer":
+                saved = str(saved).lower()
+            if saved != current:
                 raise ValueError(
                     f"resume configuration changed protected training value {key}"
                 )
@@ -463,7 +529,10 @@ class PMFColorizerModule(pl.LightningModule):
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
         super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
         if self.ema is not None:
-            self.ema.update(self.model)
+            if self._ema_images_pending <= 0:
+                raise RuntimeError("EMA update has no observed training images")
+            self.ema.update(self.model, global_images=self._ema_images_pending)
+            self._ema_images_pending = 0
 
     def on_before_optimizer_step(self, optimizer):
         squared_norm = torch.zeros((), device=self.device)
@@ -486,32 +555,30 @@ class PMFColorizerModule(pl.LightningModule):
         self.ema.move_to(self.model)
         return True
 
-    def ema_scope(self):
+    def ema_scope(self, variant: Optional[str] = None):
         if self.ema is None or not self.ema.ready:
             from contextlib import nullcontext
 
             return nullcontext()
-        return self.ema.scope(self.model)
+        return self.ema.scope(self.model, variant)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-            betas=(0.9, 0.999),
-        )
-        max_steps = self.max_steps
-        if max_steps is None and self.trainer is not None:
-            max_steps = self.trainer.estimated_stepping_batches
-        max_steps = max(max_steps or 1, self.warmup_steps + 1)
+        if self.optimizer_name == "muon":
+            optimizer = Muon(self.parameters(), lr=self.learning_rate,
+                             weight_decay=self.weight_decay, adam_b2=self.adam_b2)
+        elif self.optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate,
+                                          weight_decay=self.weight_decay,
+                                          betas=(0.9, self.adam_b2))
+        else:
+            raise ValueError("optimizer must be 'muon' or explicit legacy 'adamw'")
 
         def schedule(step: int) -> float:
             if step < self.warmup_steps:
                 return float(step + 1) / float(max(self.warmup_steps, 1))
-            progress = (step - self.warmup_steps) / float(
-                max(max_steps - self.warmup_steps, 1)
-            )
-            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+            if self.lr_schedule != "constant":
+                raise ValueError("faithful pMF uses constant LR after optional warmup")
+            return 1.0
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
         return {
