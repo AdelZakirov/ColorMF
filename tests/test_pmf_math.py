@@ -104,6 +104,22 @@ def test_l_is_closed_over_not_a_jvp_primal():
     assert terms.z.shape[1] == 2
 
 
+def test_checkpointed_objective_generator_is_forwarded_to_perceptual_crop():
+    generator = torch.Generator().manual_seed(123)
+    observed = []
+
+    def perceptual(predicted, target, luminance, *, generator):
+        observed.append(generator)
+        zeros = torch.zeros(predicted.shape[0], device=predicted.device)
+        return zeros, zeros
+
+    x = torch.randn(1, 2, 2, 2)
+    meanflow_terms(ToyModel(), x, torch.randn(1, 1, 2, 2),
+                   generator=generator, perceptual_fn=perceptual,
+                   lpips_weight=0.4)
+    assert observed == [generator]
+
+
 def test_small_time_clean_conversion_and_endpoint_derivative():
     z, clean = torch.ones(1, 2, 2, 2), torch.zeros(1, 2, 2, 2)
     assert torch.equal(average_velocity(z, clean, torch.tensor([0.01])),

@@ -5,7 +5,11 @@ import torch
 kornia = pytest.importorskip("kornia")
 
 from src.lab import lab_to_rgb, rgb_to_lab
-from src.perceptual import PerceptualLosses, normalized_lab_to_rgb
+from src.perceptual import (
+    PerceptualLosses,
+    normalized_lab_to_rgb,
+    paired_random_resized_crop,
+)
 
 
 class IdentityFeatures(torch.nn.Module):
@@ -61,3 +65,15 @@ def test_convnext_receives_official_minus_one_to_one_range_without_mean_std():
     expected_pixel = expected[:, :, :1, :1].expand_as(convnext.last_input)
     torch.testing.assert_close(convnext.last_input, expected_pixel,
                                atol=2e-5, rtol=1e-5)
+
+
+def test_paired_crop_uses_supplied_generator_deterministically():
+    image = torch.arange(2 * 3 * 32 * 32, dtype=torch.float32).reshape(2, 3, 32, 32)
+    first_a, second_a = paired_random_resized_crop(
+        image, image + 1, out_size=16,
+        generator=torch.Generator().manual_seed(77))
+    first_b, second_b = paired_random_resized_crop(
+        image, image + 1, out_size=16,
+        generator=torch.Generator().manual_seed(77))
+    torch.testing.assert_close(first_a, first_b)
+    torch.testing.assert_close(second_a, second_b)

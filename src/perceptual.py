@@ -103,11 +103,12 @@ class PerceptualLosses:
                 network.to(device)
         return self
 
-    def __call__(self, predicted_ab: Tensor, target_ab: Tensor, L: Tensor) -> tuple[Tensor, Tensor]:
+    def __call__(self, predicted_ab: Tensor, target_ab: Tensor, L: Tensor, *,
+                 generator: Optional[torch.Generator] = None) -> tuple[Tensor, Tensor]:
         predicted_rgb = normalized_lab_to_rgb(L, predicted_ab)
         target_rgb = normalized_lab_to_rgb(L, target_ab)
         predicted_rgb, target_rgb = paired_random_resized_crop(
-            predicted_rgb, target_rgb, out_size=224)
+            predicted_rgb, target_rgb, out_size=224, generator=generator)
         batch = predicted_rgb.shape[0]
         zeros = torch.zeros(batch, device=predicted_rgb.device, dtype=torch.float32)
         if self.lpips is None:

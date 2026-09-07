@@ -85,6 +85,9 @@ LPIPS receives
 `2*RGB-1`; matching official pMF, ConvNeXt receives that same `[-1,1]` tensor
 directly without an additional ImageNet mean/std transform. No clamp is applied to
 generated chroma or to Kornia RGB before the frozen loss networks.
+The paired random resized crop receives the same checkpointed objective
+generator as `(r,t)` and noise, so resumed training also reproduces perceptual
+crop sampling.
 
 Sampling is exactly one NFE. For `z_1 ~ N(0,I)`, `t=1`, `r=0`, the network
 runs its shared and u branches once and returns `ab = z_1-u`. The v branch is
@@ -121,10 +124,12 @@ in the faithful configs, matching the pinned official B/16 default. No color
 augmentation is used.
 
 ```bash
+./venv/bin/pip install -r requirements.txt
 ./venv/bin/python train.py --config configs/pmf_b_128_colorization.yaml
 ./venv/bin/python sample.py --config configs/pmf_b_128_colorization.yaml \
   --checkpoint checkpoints/pmf_b_8_128/last.ckpt \
   --input input.jpg --output colorized.png --seed 42 --ema-variant 1000
+./venv/bin/pip install -r requirements-dev.txt  # Optax parity test only
 ./venv/bin/python -m pytest -q
 ```
 

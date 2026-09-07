@@ -113,7 +113,7 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
                    adaptive_power: float = 1.0, adaptive_epsilon: float = 0.01,
                    p_mean: float = 0.8, p_std: float = 0.8, data_proportion: float = 0.5,
                    tr_uniform: bool = False, uniform_probability: float = 0.1,
-                   perceptual_fn: Optional[Callable[[Tensor, Tensor, Tensor], tuple[Tensor, Tensor]]] = None,
+                   perceptual_fn: Optional[Callable[..., tuple[Tensor, Tensor]]] = None,
                    lpips_weight: float = 0.0, convnext_weight: float = 0.0,
                    perceptual_max_t: float = 0.8) -> MeanFlowTerms:
     """Evaluate official pMF training math for stochastic chroma state only."""
@@ -157,7 +157,8 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
     lpips_examples = convnext_examples = zeros
     perceptual_examples = zeros
     if perceptual_fn is not None and (lpips_weight or convnext_weight):
-        lpips_raw, convnext_raw = perceptual_fn(reconstructed_ab, x, L)
+        lpips_raw, convnext_raw = perceptual_fn(
+            reconstructed_ab, x, L, generator=generator)
         mask = t.flatten() < perceptual_max_t
         lpips_examples = torch.where(mask, lpips_raw.float(), zeros)
         convnext_examples = torch.where(mask, convnext_raw.float(), zeros)

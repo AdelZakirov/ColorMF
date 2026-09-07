@@ -4,15 +4,34 @@ The matrix is transposed between frameworks because Flax stores Dense kernels
 as [fan_in, fan_out], while torch.nn.Linear stores [fan_out, fan_in].
 """
 
-import jax.numpy as jnp
+import importlib.metadata
+import json
+
 import numpy as np
-import optax
+import pytest
 import torch
+
+jax = pytest.importorskip("jax")
+optax = pytest.importorskip("optax")
+jnp = jax.numpy
+
+OPTAX_REFERENCE_COMMIT = "e3a96e9487d1a9c670b67395f02603439e52905b"
 
 from src.optimizer import Muon
 
 
+def _require_pinned_optax_reference():
+    direct_url = importlib.metadata.distribution("optax").read_text("direct_url.json")
+    if direct_url is None:
+        pytest.fail("install requirements-dev.txt to use the pinned Optax reference")
+    installed_commit = json.loads(direct_url).get("vcs_info", {}).get("commit_id")
+    if installed_commit != OPTAX_REFERENCE_COMMIT:
+        pytest.fail(
+            f"Optax checkout is {installed_commit!r}, expected {OPTAX_REFERENCE_COMMIT}")
+
+
 def test_one_step_matches_optax_for_matrix_vector_and_token_tensor():
+    _require_pinned_optax_reference()
     learning_rate = 1e-3
     torch_parameters = {
         "matrix": torch.tensor([[0.2, -0.1], [0.3, 0.5], [-0.4, 0.7]],
