@@ -134,8 +134,12 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
     z = interpolate(x, noise, t)
     target = stabilized_velocity_target(x, noise, z, t).detach()
 
-    # Official structure: v direction is the auxiliary prediction at h=0.
-    _, v_direction = model(z, L, t, t)
+    with torch.no_grad():
+        direction_fn = getattr(model, "auxiliary_direction", None)
+        if direction_fn is None:
+            _, v_direction = model(z, L, t, t)
+        else:
+            v_direction = direction_fn(z, L, t)
     if v_direction is None:
         raise RuntimeError("training requires the deep v branch")
 
@@ -157,14 +161,19 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
     lpips_examples = convnext_examples = zeros
     perceptual_examples = zeros
     if perceptual_fn is not None and (lpips_weight or convnext_weight):
-        lpips_raw, convnext_raw = perceptual_fn(
-            reconstructed_ab, x, L, generator=generator)
         mask = t.flatten() < perceptual_max_t
-        lpips_examples = torch.where(mask, lpips_raw.float(), zeros)
-        convnext_examples = torch.where(mask, convnext_raw.float(), zeros)
-        perceptual_examples = (
-            lpips_weight * _adaptive_values(lpips_examples, adaptive_power, adaptive_epsilon)
-            + convnext_weight * _adaptive_values(convnext_examples, adaptive_power, adaptive_epsilon))
+        active_indices = mask.nonzero(as_tuple=True)[0]
+        if active_indices.numel():
+            lpips_raw, convnext_raw = perceptual_fn(
+                reconstructed_ab[active_indices], x[active_indices], L[active_indices],
+                generator=generator)
+            lpips_examples = zeros.clone()
+            convnext_examples = zeros.clone()
+            lpips_examples[active_indices] = lpips_raw.float()
+            convnext_examples[active_indices] = convnext_raw.float()
+            perceptual_examples = (
+                lpips_weight * _adaptive_values(lpips_examples, adaptive_power, adaptive_epsilon)
+                + convnext_weight * _adaptive_values(convnext_examples, adaptive_power, adaptive_epsilon))
 
     total_examples = loss_u_examples + auxiliary_weight * loss_v_examples + perceptual_examples
     return MeanFlowTerms(

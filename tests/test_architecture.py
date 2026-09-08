@@ -38,6 +38,43 @@ def test_rope_preserves_prefix_tokens():
     assert not torch.equal(rotated[:, 4:], x[:, 4:])
 
 
+def test_no_grad_attention_uses_explicit_softmax():
+    attention = tiny_model().shared_blocks[0].attn.eval()
+    from src.model import apply_rotary_pos_emb, precompute_rope_freqs
+    x = torch.randn(2, 20, 32)
+    rope = precompute_rope_freqs(8, 16)
+    shape = (2, 20, attention.num_heads, attention.head_dim)
+    with torch.no_grad():
+        q = apply_rotary_pos_emb(
+            attention.q_norm(attention.q_proj(x).reshape(shape)), rope)
+        k = apply_rotary_pos_emb(
+            attention.k_norm(attention.k_proj(x).reshape(shape)), rope)
+        v = attention.v_proj(x).reshape(shape)
+        weights = torch.einsum("bqhd,bkhd->bhqk", q / attention.head_dim ** 0.5, k)
+        weights = torch.softmax(weights, dim=-1)
+        expected = attention.out_proj(torch.einsum(
+            "bhqk,bkhd->bqhd", weights, v).reshape(2, 20, 32))
+        actual = attention(x, rope)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_auxiliary_direction_matches_full_forward_v_branch():
+    model = tiny_model().eval()
+    with torch.no_grad():
+        for block in [*model.shared_blocks, *model.v_blocks]:
+            block.attn_scale.normal_(std=0.02)
+            block.mlp_scale.normal_(std=0.02)
+        model.v_final_layer.linear._flax_linear.weight.normal_(std=0.01)
+        model.v_final_layer.linear._flax_linear.bias.normal_(std=0.01)
+    z = torch.randn(2, 2, 16, 16)
+    L = torch.randn(2, 1, 16, 16)
+    t = torch.tensor([0.2, 0.7])
+    with torch.no_grad():
+        expected = model(z, L, t, t)[1]
+        actual = model.auxiliary_direction(z, L, t)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_faithful_configs_have_256_spatial_tokens_and_recipe():
     root = Path(__file__).resolve().parents[1]
     for resolution, patch in ((64, 4), (128, 8), (256, 16)):

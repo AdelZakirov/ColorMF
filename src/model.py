@@ -322,6 +322,16 @@ class PixelMeanFlowB(nn.Module):
             v_sequence[:, self.prefix_tokens:]))
         return u, self._velocity(z, v_clean, t)
 
+    def auxiliary_direction(self, z: Tensor, L: Tensor, t: Tensor) -> Tensor:
+        sequence = self._sequence(z, L, torch.zeros_like(t))
+        for block in self.shared_blocks:
+            sequence = block(sequence, self.rope_freqs)
+        for block in self.v_blocks:
+            sequence = block(sequence, self.rope_freqs)
+        clean = self._unpatchify(self.v_final_layer(
+            sequence[:, self.prefix_tokens:]))
+        return self._velocity(z, clean, t)
+
     @staticmethod
     def _stable_seed(image_id: str, seed: int) -> int:
         digest = hashlib.sha256(f"{image_id}|{seed}".encode()).digest()

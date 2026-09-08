@@ -136,6 +136,16 @@ augmentation is used.
 PyTorch Lightning retains BF16, DDP, deterministic objective RNG checkpointing,
 MLflow, qualitative grids, and checkpoint resume.
 
+Validation runs at the end of each epoch by default. To validate every fixed
+number of optimizer steps, set `training.validation_check_interval_steps`; the
+launcher converts it through `accumulate_grad_batches`, so for example
+`validation_check_interval_steps: 100` with accumulation 64 validates every
+6,400 train batches, or every 100 optimizer steps.
+
+Training-step metrics are sent to MLflow every optimizer step by default via
+`training.log_every_n_steps: 1`; increase this value only when reducing metric
+history volume is more important than a dense loss curve.
+
 ## Audit map
 
 | Official pMF component | ColorMF implementation | adaptation and reason |

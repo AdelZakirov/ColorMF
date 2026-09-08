@@ -52,6 +52,34 @@ def training_log_dir(config: dict) -> str:
     return config.get("log_dir", "logs")
 
 
+def validation_trainer_kwargs(training: dict) -> dict:
+    interval_steps = training.get("validation_check_interval_steps")
+    if interval_steps is None:
+        return {}
+    if isinstance(interval_steps, bool) or not isinstance(interval_steps, int):
+        raise ValueError("validation_check_interval_steps must be a positive integer")
+    if interval_steps <= 0:
+        raise ValueError("validation_check_interval_steps must be a positive integer")
+    accumulation = training.get("accumulate_grad_batches", 1)
+    if isinstance(accumulation, bool) or not isinstance(accumulation, int) or accumulation <= 0:
+        raise ValueError("accumulate_grad_batches must be a positive integer")
+    return {
+        "val_check_interval": interval_steps * accumulation,
+        "check_val_every_n_epoch": None,
+    }
+
+
+def logging_trainer_kwargs(training: dict) -> dict:
+    log_every_n_steps = training.get("log_every_n_steps", 1)
+    if (
+        isinstance(log_every_n_steps, bool)
+        or not isinstance(log_every_n_steps, int)
+        or log_every_n_steps <= 0
+    ):
+        raise ValueError("log_every_n_steps must be a positive integer")
+    return {"log_every_n_steps": log_every_n_steps}
+
+
 def _git_value(*arguments: str, fallback: str = "unknown") -> str:
     try:
         result = subprocess.run(
@@ -180,6 +208,8 @@ def main():
         max_epochs=training["max_epochs"],
         max_steps=training.get("max_steps") or -1,
         accumulate_grad_batches=training.get("accumulate_grad_batches", 1),
+        **validation_trainer_kwargs(training),
+        **logging_trainer_kwargs(training),
         gradient_clip_val=training["gradient_clip_val"],
         callbacks=[checkpoint],
         logger=build_logger(training),

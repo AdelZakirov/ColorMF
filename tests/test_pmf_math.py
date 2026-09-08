@@ -115,9 +115,34 @@ def test_checkpointed_objective_generator_is_forwarded_to_perceptual_crop():
 
     x = torch.randn(1, 2, 2, 2)
     meanflow_terms(ToyModel(), x, torch.randn(1, 1, 2, 2),
-                   generator=generator, perceptual_fn=perceptual,
+                   generator=generator, r=torch.tensor([0.1]), t=torch.tensor([0.2]),
+                   perceptual_fn=perceptual,
                    lpips_weight=0.4)
     assert observed == [generator]
+
+
+def test_perceptual_function_receives_only_samples_below_cutoff():
+    observed = []
+    x = torch.randn(3, 2, 2, 2)
+    L = torch.randn(3, 1, 2, 2)
+
+    def perceptual(predicted, target, luminance, *, generator):
+        del generator
+        observed.append((predicted.shape[0], target.shape[0], luminance.shape[0]))
+        assert torch.equal(target, x[[0, 2]])
+        assert torch.equal(luminance, L[[0, 2]])
+        values = torch.ones(predicted.shape[0], device=predicted.device)
+        return values, values
+
+    terms = meanflow_terms(
+        ToyModel(), x, L, noise=torch.randn_like(x),
+        r=torch.tensor([0.1, 0.2, 0.3]), t=torch.tensor([0.2, 0.8, 0.79]),
+        perceptual_fn=perceptual, lpips_weight=0.4, convnext_weight=0.1,
+        perceptual_max_t=0.8)
+
+    assert observed == [(2, 2, 2)]
+    assert torch.count_nonzero(terms.perceptual_lpips_loss) == 1
+    assert torch.count_nonzero(terms.perceptual_convnext_loss) == 1
 
 
 def test_small_time_clean_conversion_and_endpoint_derivative():
