@@ -1,207 +1,134 @@
+<div align="center">
+
 # ColorMF
 
-ColorMF is a minimal conditional Pixel MeanFlow (pMF) colorizer. The only
-stochastic state is normalized chroma `ab`; normalized luminance `L` is
-concatenated as a fixed condition:
+**One-step stochastic image colorization with Pixel Mean Flow**
+
+[pMF paper](https://arxiv.org/abs/2601.22158) · [official implementation](https://github.com/Lyy-iiis/pMF) · PyTorch + Lightning
+
+</div>
+
+![ColorMF predictions](assets/color-mf-showcase.jpg)
+
+Each row uses one luminance image and three random seeds. The ground-truth color image is shown only for comparison; its chroma is never given to the model.
+
+## What is ColorMF?
+
+ColorMF adapts **Pixel Mean Flow (pMF)** from class-conditioned image generation to probabilistic colorization. Instead of conditioning on an ImageNet class, the transformer receives the black-and-white image as a spatial luminance channel. It generates the two missing CIELAB chroma channels, `a` and `b`.
+
+The result is a compact conditional generative model with:
+
+- **one network evaluation per sample**;
+- **multiple plausible colorizations** from different random seeds;
+- a fixed luminance path, so the model generates color rather than structure;
+- no text encoder, VAE, diffusion schedule, or pretrained image generator.
+
+The checkpoint used for the examples above was trained from scratch on **FFHQ at 64×64**. The displayed images are held-out **CelebA** examples. Inference runs at 64×64; for display, predicted chroma is resized to the source resolution and combined with the source-resolution luminance.
+
+## Method
+
+An RGB image is converted to CIELAB and split into luminance `L` and chroma `ab`. Only chroma belongs to the stochastic state:
+
+$$
+z_t = (1-t)\,ab + t\,\epsilon, \qquad \epsilon \sim \mathcal{N}(0,I).
+$$
+
+The transformer sees the noisy chroma and fixed luminance together:
 
 ```text
-z_t = (1 - t) * ab + t * epsilon
-model input = cat(z_t, L)
+network input = concat(z_t, L)
+network output = two-channel chroma prediction
 ```
 
-The model is a from-scratch DiT-style transformer and standard inference uses
-one evaluation at `(r=0, t=1)`. It has no U-Net, diffusion schedule, VAE,
-latent state, CFG, pretrained image encoder, or bounded output activation.
+Training follows the pMF average-velocity objective and uses the auxiliary instantaneous-velocity branch for the JVP direction. At inference, sampling starts from Gaussian chroma noise at `t=1` and reaches a clean `ab` estimate in one forward pass. `L` is never noised, interpolated, or predicted.
 
-After loading a checkpoint into `PMFColorizerModule`, sampling is exposed as:
-
-```python
-ab = model.sample(L, seed=42, image_ids=["image-001"])
-ab_samples = model.sample(
-    L[:1], seeds=[1, 2, 3, 4], image_ids=["image-001"]
-)
-lab = model.sample_lab(L[:1], seed=42, image_ids=["image-001"])
+```mermaid
+flowchart LR
+    A[RGB image] --> B[CIELAB]
+    B --> C[fixed L]
+    N[Gaussian ab noise] --> M[pMF transformer]
+    C --> M
+    M --> D[predicted ab]
+    C --> E[LAB to RGB]
+    D --> E
+    E --> F[colorized image]
 ```
 
-## Reference audit
+## Quick Start
 
-The primary source of truth is the official pMF PyTorch implementation:
-
-* paper: https://arxiv.org/abs/2601.22158
-* repository: https://github.com/Lyy-iiis/pMF
-* PyTorch branch: https://github.com/Lyy-iiis/pMF/tree/torch
-* improved MeanFlow reference: https://arxiv.org/abs/2512.02012
-
-The implementation audit was performed against the official PyTorch branch at
-the commit recorded below. The exact SHA is kept here so future changes do not
-silently drift from the reference:
-
-```text
-official pMF repository SHA: 75f6073042c21f7104686261a0c4784db4ede9d1
-official pMF torch-branch SHA: 990e81a84249dbd68a128accef67eb95621d10b1
-official Improved MeanFlow SHA: bf60cd7cb653f6628e59d48034b333c5eba445e2
-```
-
-The official `torch` branch is inference-only; the training audit therefore
-uses the official JAX `main` commit for `(r,t)` sampling and the objective,
-with the torch commit checked for the equivalent clean-x conversion and
-one-step update. ColorMF deliberately omits CFG and all ImageNet-specific
-conditioning. Its transformer embeds only `h=t-r`, while `t` still enters
-the clean-x velocity conversion.
-
-Audited reference locations are `pmf.py:150-181` for pair sampling,
-`pmf.py:385-397` for interpolation and the stabilized target,
-`pmf.py:411-428` for the JVP/stop-gradient compound field,
-`pmf.py:426-462` for adaptive losses, and
-`models/pmfDiT.py:336-378` for clean-x/velocity heads and endpoint
-conversion. The torch branch's corresponding one-step solver is
-`pmf.py:78-145`.
-
-The equation-to-code map is:
-
-| pMF concept | ColorMF implementation | Reference role |
-| --- | --- | --- |
-| `z_t = (1-t)x + t epsilon` | `src/pmf.py:interpolate` | linear probability path |
-| ordered logit-normal `(r,t)` sampling | `src/pmf.py:sample_rt` | pMF `sample_tr` |
-| clean-x output | `PMFTiny.clean_head` | data endpoint estimate |
-| average velocity | `src/pmf.py:average_velocity` | `(z-x_hat)/clip(t,0.05,1)` |
-| auxiliary instantaneous velocity | `PMFTiny.velocity_head` plus `average_velocity` | sampled-interval v loss and h=0 tangent |
-| JVP primals/tangents | `src/pmf.py:jvp_average_velocity` | `(z,r,t)` along `(v_dir,0,1)` with fixed L |
-| stop-gradient | `src/pmf.py:meanflow_terms` | `jvp.detach()` in corrected velocity |
-| main and auxiliary losses | `src/pmf.py:meanflow_terms` | adaptive summed velocity losses |
-| one-step sampler | `PMFTiny.sample` | one main model evaluation |
-
-The independent test oracle in `tests/test_pmf_math.py` repeats the equations
-without using the transformer implementation and compares forward values,
-JVPs, losses, and parameter gradients.
-
-The production target uses the reference stabilized form
-`(z_t-x)/clip(t, 0.05, 1)`, which equals `epsilon-x` away from the low-time
-endpoint. Main and auxiliary residuals are summed per example and adaptively
-normalized with `S / stop_gradient((S + 0.01)^1)`. The configurable
-`auxiliary_weight` defaults to one, matching the official pMF sum; no
-perceptual losses are enabled in V1.
-
-The pilot explicitly uses the published 256px B/16 logit-normal recipe
-`p_mean=0.8`, `p_std=0.8`, with the flow-matching diagonal proportion and
-uniform replacement probability configurable under `training.time_sampling`.
-
-## LAB convention
-
-The legacy `/mnt/WORKSPACE/aza_workspace/palette` loader was audited. It reads
-RGB with OpenCV, uses a random 256 crop followed by resize, brightness/
-contrast or CLAHE, horizontal flip, and optional border/texture/noise
-augmentation, converts with `cv2.COLOR_RGB2LAB`, and applies
-`Normalize(max_pixel_value=127.5)`. ColorMF preserves the conversion and
-uses crop/resize plus horizontal flip only. It intentionally conditions on
-OpenCV LAB `L`, not the legacy loader's `ToGray(RGB)` output, and its training
-crop is always selected when the source image is large enough. These are
-intentional differences rather than a claim of legacy-equivalent preprocessing:
-photometric and synthetic noise augmentation would change the conditional
-color distribution rather than merely regularize geometry.
-
-* `L_norm = L_opencv / 127.5 - 1`;
-* `ab_norm = ab_opencv / 127.5 - 1`;
-* physical `L* = (L_norm + 1) * 50`;
-* physical `a*/b* = (ab_norm + 1) * 127.5 - 128`.
-
-`src/lab.py` is the single conversion boundary. `compose_lab` copies the
-original `L` tensor unchanged. `lab_to_rgb` clips only the OpenCV byte
-encoding for visualization; out-of-sRGB-gamut colors can therefore be
-clipped, and no luminance-preservation claim is made for that display step.
-
-For very large datasets, use a line manifest. `IndexedManifest` stores only
-byte offsets and opens one image lazily per sample instead of loading image
-metadata or pixels into RAM.
-
-## pMF-Tiny size
-
-The default 256x256 configuration uses patch size 16, hidden size 384, depth
-12, 8 heads, and MLP ratio 4. The exact report from `PMFTiny().parameter_report()`
-is:
-
-```text
-total training parameters: 32,905,600
-inference-required parameters: 32,708,480
-auxiliary-v-head parameters: 197,120
-```
-
-The auxiliary velocity head is omitted from the one-step sampling forward
-pass. The clean head and transformer trunk remain required for inference.
-
-## Training and sampling
-
-Install PyTorch, PyTorch Lightning, OpenCV, Pillow, NumPy, and PyYAML in the
-target environment. Then configure manifests or roots in
-`configs/pilot.yaml`:
+Create an environment and install the dependencies:
 
 ```bash
-./.venv/bin/python train.py --config configs/pilot.yaml
-./.venv/bin/python sample.py --config configs/pilot.yaml \
-  --checkpoint checkpoints/last.ckpt \
-  --input input.jpg --output colorized.png --seed 42
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-Set `training.devices` to an integer greater than one to use Lightning-native
-`strategy="ddp"`. Training metrics use `sync_dist=True`; validation metrics
-are deduplicated by image ID after gathering padded distributed shards.
-Lightning owns distributed sampling and checkpointing, and only global rank
-zero writes qualitative grids after collecting requested examples from every
-rank. Objective RNG streams are rank-separated and their generator state is
-stored in checkpoints. Data-order and augmentation state are not promised to
-resume bit-for-bit.
-
-Conservative AdamW, warmup, clipping, and BF16 settings in the pilot config
-are experiment settings, not pMF requirements. Mathematical tests are FP32;
-the objective explicitly casts adaptive loss reductions to FP32 under BF16
-autocast.
-
-The pilot logs locally with MLflow in the SQLite database `./mlflow.db`. Start
-the tracking UI in a second terminal with:
+Sample one image with a local checkpoint:
 
 ```bash
-./.venv/bin/mlflow ui --backend-store-uri sqlite:///./mlflow.db \
-  --default-artifact-root ./mlartifacts --host 127.0.0.1 --port 5000
+python sample.py \
+  --config configs/pmf_t_64_colorization.yaml \
+  --checkpoint checkpoints/pmf_t_4_64/last.ckpt \
+  --input portrait.jpg \
+  --output colorized.jpg \
+  --seed 42 \
+  --ema-variant 500
 ```
 
-Open `http://127.0.0.1:5000` to inspect the `tmp` experiment. The run records
-the flattened training configuration as parameters, all Lightning training
-and validation metrics, and qualitative validation grids as artifacts under
-`./mlartifacts`. By default, the first four validation images are rendered as
-`L | GT | seed1 | seed2 | seed3 | seed4` grids. Set `validation.image_ids` to
-choose specific examples, or change `validation.image_count` and
-`validation.sample_seeds`. The grids are logged under `qualitative/current/`;
-the same artifact paths are replaced after each validation epoch rather than
-creating an unbounded epoch-by-epoch image history.
-Training maintains an EMA shadow with decay `0.9999`; EMA starts after the
-configured warm-up and validation and qualitative grids use it only after it is
-ready. EMA state is included in checkpoints. Standalone sampling uses EMA
-weights when they are ready; pass `--no-ema` to use the raw checkpoint weights.
-Checkpoints remain in `training.checkpoint_dir` and are not duplicated into
-MLflow by default. To use the shared server instead, change
-`training.logger.tracking_uri` to its HTTPS URL.
+The model uses only the resized image's `L` channel. Change `--seed` to draw a different chroma sample while preserving the same luminance condition.
 
-## Validation status in this checkout
+Checkpoints are not stored in this repository. Place downloaded or locally trained weights under `checkpoints/`, or pass any checkpoint path explicitly.
 
-Implemented and runnable:
+## Training
 
-* FP32 analytical JVP test;
-* independent pMF forward/JVP/loss/gradient comparison;
-* fixed 2-D patch positional representation;
-* LAB normalization and RGB conversion tests;
-* one-step sampling, NFE count, and batch/individual seed reproducibility;
-* single-batch transformer pMF smoke test;
-* Lightning-native DDP configuration and checkpoint callback;
-* Python 3.13 environment with the mounted dataset adapter;
-* one real-data BF16 Lightning training batch at the configured 256x256 shape
-  on an RTX 4090;
-* checkpoint save/resume through Lightning, including objective RNG state and
-  protected training-configuration checks;
-* one-step GPU sampling with stable image-ID/seed noise and exact luminance
-  preservation;
-* fixed validation qualitative-grid generation with MLflow artifact replacement.
+Manifests contain one image path per line. Relative paths are resolved beside the manifest, with a sibling `256/` directory supported for FFHQ-style layouts. Update the data paths and batch settings in a config, then run:
 
-`NOT TESTED`: this checkout exposes one GPU, so a multi-GPU DDP smoke test,
-distributed metric run, and real multi-GPU pilot remain unverified. The mounted
-dataset and single-GPU Lightning path are validated; the DDP and pilot commands
-are provided for an environment with at least two visible GPUs.
+```bash
+python train.py --config configs/pmf_t_64_colorization.yaml
+```
+
+The repository includes Tiny, Small, and pMF-B configurations. The B variants preserve the official 16×16 token geometry at 64, 128, and 256 pixels. Training supports Lightning DDP, BF16, Muon, EDM multi-EMA, MLflow logging, checkpoint resume, and optional LPIPS/ConvNeXt auxiliary losses.
+
+## CelebA Evaluation
+
+`sample_celeba.py` reproduces the evaluation layout used above. It saves native 64×64 predictions and a second set where sampled `ab` is bicubically resized and combined with the original-size `L`:
+
+```bash
+python sample_celeba.py \
+  --manifest /path/to/celeba.txt \
+  --image-root /path/to/celeba/256 \
+  --checkpoint checkpoints/pmf_t_4_64/last.ckpt \
+  --count 20 \
+  --sample-seeds 1 2 3 4 5
+```
+
+Generated evaluation folders are ignored by Git; keep only selected figures in `assets/`.
+
+## Reference Fidelity
+
+The implementation follows the official pMF formulation rather than replacing it with generic flow matching. In particular, it preserves:
+
+- clean-endpoint to average-velocity conversion;
+- the auxiliary instantaneous-velocity branch;
+- JVP-based mean-flow consistency with fixed `L`;
+- one-step `t=1 → r=0` sampling;
+- the pMF transformer topology, RMSNorm, QK normalization, 2-D RoPE, SwiGLU, and time-prefix tokens.
+
+The primary references are pinned in the source history:
+
+- pMF JAX training/objective: [`Lyy-iiis/pMF@75f6073`](https://github.com/Lyy-iiis/pMF/tree/75f6073042c21f7104686261a0c4784db4ede9d1)
+- pMF PyTorch architecture: [`Lyy-iiis/pMF@990e81a`](https://github.com/Lyy-iiis/pMF/tree/990e81a84249dbd68a128accef67eb95621d10b1)
+- Improved Mean Flow: [arXiv:2512.02012](https://arxiv.org/abs/2512.02012)
+
+## Tests
+
+```bash
+python -m pytest -q
+```
+
+The suite covers objective math, analytical JVP behavior, sampling determinism, LAB conversion, architecture geometry, EMA, Muon parity, perceptual losses, checkpointing, and distributed smoke execution.
+
+## Acknowledgements
+
+ColorMF is an adaptation of **Pixel Mean Flow** by the pMF authors. The generative method and core architecture originate in their paper and official repository; this project changes the task formulation to conditional CIELAB colorization and provides the PyTorch training and evaluation path used here.

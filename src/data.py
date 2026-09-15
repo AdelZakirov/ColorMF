@@ -8,9 +8,30 @@ from typing import Optional, Sequence, Tuple
 
 import cv2
 import pytorch_lightning as pl
+import numpy as np
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from .lab import rgb_to_lab
+
+
+def adm_center_crop(image: np.ndarray, image_size: int) -> np.ndarray:
+    """Literal NumPy/Pillow port of official pMF's ADM center_crop_arr."""
+    pil_image = Image.fromarray(image)
+    while min(pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(
+            tuple(value // 2 for value in pil_image.size),
+            resample=Image.Resampling.BOX,
+        )
+    scale = image_size / min(pil_image.size)
+    pil_image = pil_image.resize(
+        tuple(round(value * scale) for value in pil_image.size),
+        resample=Image.Resampling.BICUBIC,
+    )
+    resized = np.asarray(pil_image)
+    top = (resized.shape[0] - image_size) // 2
+    left = (resized.shape[1] - image_size) // 2
+    return resized[top : top + image_size, left : left + image_size]
 
 
 class IndexedManifest:
@@ -65,7 +86,8 @@ class PaletteDataset(Dataset):
         manifest: Optional[str] = None,
         size: Tuple[int, int] = (256, 256),
         train: bool = False,
-        horizontal_flip: bool = True,
+        horizontal_flip: bool = False,
+        resize_strategy: str = "center_crop",
     ):
         if (paths is None) == (manifest is None):
             raise ValueError("provide exactly one of paths or manifest")
@@ -73,6 +95,7 @@ class PaletteDataset(Dataset):
         self.size = tuple(size)
         self.train = train
         self.horizontal_flip = horizontal_flip
+        self.resize_strategy = resize_strategy
 
     def __len__(self) -> int:
         return len(self.items)
@@ -93,9 +116,16 @@ class PaletteDataset(Dataset):
             raise FileNotFoundError(f"could not decode image: {path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         target_height, target_width = self.size
-        image = cv2.resize(
-            image, (target_width, target_height), interpolation=cv2.INTER_CUBIC
-        )
+        if self.resize_strategy == "center_crop":
+            if target_height != target_width:
+                raise ValueError("official ADM center crop requires a square target")
+            image = adm_center_crop(image, target_height)
+        elif self.resize_strategy == "stretch":
+            image = cv2.resize(
+                image, (target_width, target_height), interpolation=cv2.INTER_CUBIC
+            )
+        else:
+            raise ValueError("resize_strategy must be 'center_crop' or explicit legacy 'stretch'")
         if self.train and self.horizontal_flip and random.random() < 0.5:
             image = image[:, ::-1].copy()
         L, ab = rgb_to_lab(image)
@@ -123,7 +153,8 @@ class PaletteDataModule(pl.LightningDataModule):
         batch_size: int = 8,
         val_batch_size: int = 4,
         num_workers: int = 4,
-        horizontal_flip: bool = True,
+        horizontal_flip: bool = False,
+        resize_strategy: str = "center_crop",
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -144,6 +175,7 @@ class PaletteDataModule(pl.LightningDataModule):
         common = {
             "size": tuple(self.hparams.resolution),
             "horizontal_flip": self.hparams.horizontal_flip,
+            "resize_strategy": self.hparams.resize_strategy,
         }
         self.train_dataset = PaletteDataset(**train_kwargs, train=True, **common)
         self.val_dataset = PaletteDataset(**val_kwargs, train=False, **common)

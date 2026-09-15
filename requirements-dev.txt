@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Direct cross-framework Muon parity reference. This is the Optax revision
+# immediately preceding the pinned official pMF training commit.
+jax[cpu]>=0.5.3
+optax @ git+https://github.com/google-deepmind/optax.git@e3a96e9487d1a9c670b67395f02603439e52905b

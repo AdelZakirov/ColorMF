@@ -1,0 +1,79 @@
+import numpy as np
+import pytest
+import torch
+
+kornia = pytest.importorskip("kornia")
+
+from src.lab import lab_to_rgb, rgb_to_lab
+from src.perceptual import (
+    PerceptualLosses,
+    normalized_lab_to_rgb,
+    paired_random_resized_crop,
+)
+
+
+class IdentityFeatures(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(()))
+        self.last_input = None
+
+    def forward(self, pixel_values):
+        self.last_input = pixel_values.detach().clone()
+        return self.scale * pixel_values.mean((2, 3))
+
+
+def test_rgb_path_is_differentiable_preserves_l_and_does_not_clamp_ab():
+    L = torch.zeros(1, 1, 8, 8)
+    ab = torch.full((1, 2, 8, 8), 2.0, requires_grad=True)
+    original_L = L.clone()
+    rgb = normalized_lab_to_rgb(L, ab)
+    rgb.sum().backward()
+    assert ab.grad is not None and torch.count_nonzero(ab.grad) > 0
+    assert torch.equal(L, original_L)
+    assert torch.equal(ab.detach(), torch.full_like(ab, 2.0))
+    assert bool(((rgb < 0) | (rgb > 1)).any())  # proves clip=False at the RGB boundary
+
+
+def test_kornia_agrees_with_opencv_on_valid_colors():
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    image[..., 0], image[..., 1], image[..., 2] = 180, 120, 80
+    L, ab = rgb_to_lab(image)
+    kornia_rgb = normalized_lab_to_rgb(L[None], ab[None])[0].permute(1, 2, 0)
+    opencv_rgb = torch.from_numpy(lab_to_rgb(L[None], ab[None])[0].copy()).float() / 255
+    torch.testing.assert_close(kornia_rgb, opencv_rgb, atol=0.025, rtol=0)
+
+
+def test_loss_networks_are_frozen():
+    lpips, convnext = IdentityFeatures(), IdentityFeatures()
+    PerceptualLosses(use_lpips=True, use_convnext=True,
+                     lpips_network=lpips, convnext_network=convnext)
+    assert all(not parameter.requires_grad
+               for network in (lpips, convnext) for parameter in network.parameters())
+
+
+def test_convnext_receives_official_minus_one_to_one_range_without_mean_std():
+    convnext = IdentityFeatures()
+    losses = PerceptualLosses(use_lpips=False, use_convnext=True,
+                              convnext_network=convnext)
+    L = torch.zeros(1, 1, 32, 32)
+    ab = torch.zeros(1, 2, 32, 32)
+    expected = normalized_lab_to_rgb(L, ab) * 2 - 1
+    losses(ab, ab, L)
+    assert convnext.last_input is not None
+    # Constant images are invariant under the paired random resized crop.
+    expected_pixel = expected[:, :, :1, :1].expand_as(convnext.last_input)
+    torch.testing.assert_close(convnext.last_input, expected_pixel,
+                               atol=2e-5, rtol=1e-5)
+
+
+def test_paired_crop_uses_supplied_generator_deterministically():
+    image = torch.arange(2 * 3 * 32 * 32, dtype=torch.float32).reshape(2, 3, 32, 32)
+    first_a, second_a = paired_random_resized_crop(
+        image, image + 1, out_size=16,
+        generator=torch.Generator().manual_seed(77))
+    first_b, second_b = paired_random_resized_crop(
+        image, image + 1, out_size=16,
+        generator=torch.Generator().manual_seed(77))
+    torch.testing.assert_close(first_a, first_b)
+    torch.testing.assert_close(second_a, second_b)

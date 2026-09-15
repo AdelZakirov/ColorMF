@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from src.ema import ExponentialMovingAverage
+from src.ema import EMAManager, ExponentialMovingAverage
 from src.lightning_module import PMFColorizerModule
 
 
@@ -64,30 +64,41 @@ def test_ema_state_roundtrip_preserves_shadow_and_step_count():
     torch.testing.assert_close(model.weight, ema._shadow["weight"])
 
 
-def test_lightning_module_updates_ema_after_optimizer_step():
+def test_edm_ema_uses_actual_images_and_roundtrips_all_variants():
     module = PMFColorizerModule(
         model={
             "resolution": 16,
             "patch_size": 4,
             "hidden_size": 32,
-            "depth": 1,
+            "depth": 2,
             "heads": 4,
+            "aux_head_depth": 1,
+            "pca_channels": 8,
         },
-        ema_decay=0.5,
+        ema_type="edm",
+        ema_half_lives_kimg=(500, 1000, 2000),
     )
     assert module.ema is not None
     module.ema.initialize(module.model)
-    initial_weight = module.model.clean_head.weight.detach().clone()
-    optimizer = torch.optim.SGD(module.parameters(), lr=0.0)
-
-    def closure():
-        with torch.no_grad():
-            module.model.clean_head.weight.fill_(2.0)
-        return torch.zeros((), requires_grad=True)
-
-    module.optimizer_step(0, 0, optimizer, closure)
+    with torch.no_grad():
+        module.model.u_final_layer.linear._flax_linear.weight.fill_(2.0)
+    module.ema.update(module.model, global_images=256)
     assert module.ema.num_updates == 1
-    torch.testing.assert_close(
-        module.ema._shadow["clean_head.weight"],
-        torch.full_like(initial_weight, 2.0),
+    assert module.ema.images_seen == 256
+    assert module.ema.variants == ("500", "1000", "2000")
+    restored = EMAManager(ema_type="edm", half_lives_kimg=(500, 1000, 2000))
+    restored.load_state_dict(module.ema.state_dict())
+    assert restored.images_seen == 256
+    for variant in restored.variants:
+        restored.copy_to(module.model, variant)
+
+
+def test_faithful_module_configures_muon():
+    module = PMFColorizerModule(
+        model={"resolution": 16, "patch_size": 4, "hidden_size": 32,
+               "depth": 2, "heads": 4, "aux_head_depth": 1,
+               "pca_channels": 8},
+        optimizer="muon",
     )
+    from src.optimizer import Muon
+    assert isinstance(module.configure_optimizers()["optimizer"], Muon)

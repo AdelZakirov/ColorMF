@@ -2,21 +2,23 @@ seed: 1234
 
 model:
   resolution: [128, 128]
-  patch_size: 16
+  patch_size: 8
   hidden_size: 384
   depth: 12
   heads: 8
   mlp_ratio: 4.0
+  aux_head_depth: 8
+  pca_channels: 128
 
 data:
   # Prefer manifests for very large datasets. Each line is either:
   #   /absolute/or/relative/path.jpg
   # or:
   #   stable-image-id<TAB>/absolute/or/relative/path.jpg
-  train_manifest: /home/AZA/datasets/ffhq/ffhq.txt
+  train_manifest: data/ffhq.txt
   val_manifest: null
   train_root: null
-  val_root: /home/AZA/datasets/test_faces
+  val_root: data/validation
   resolution: [128, 128]
   batch_size: 256
   val_batch_size: 4
@@ -31,9 +33,13 @@ training:
   max_steps: null
   accumulate_grad_batches: 1
   learning_rate: 0.001
+  optimizer: adamw
+  adam_b2: 0.999
+  lr_schedule: constant
   weight_decay: 0.0001
   warmup_steps: 1000
   auxiliary_weight: 1.0
+  noise_scale: 0.5
   time_sampling:
     # Official pMF 256px B/16 logit-normal preset.
     p_mean: 0.8
@@ -55,6 +61,7 @@ training:
   sync_batchnorm: false
   ema:
     enabled: true
+    type: fixed
     decay: 0.9999
     update_after_step: 1000
     update_every: 1

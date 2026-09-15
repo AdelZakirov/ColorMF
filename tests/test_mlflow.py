@@ -58,9 +58,11 @@ def test_local_mlflow_logs_run_data_and_artifact(tmp_path: Path):
             "resolution": [16, 16],
             "patch_size": 8,
             "hidden_size": 16,
-            "depth": 1,
-            "heads": 4,
-            "mlp_ratio": 2.0,
+                "depth": 2,
+                "heads": 4,
+                "mlp_ratio": 2.0,
+                "aux_head_depth": 1,
+                "pca_channels": 8,
         }
     )
     logger.log_hyperparams(config)
@@ -93,3 +95,29 @@ def test_local_mlflow_logs_run_data_and_artifact(tmp_path: Path):
         )
     )
     assert downloaded.read_text(encoding="utf-8") == "updated qualitative output\n"
+
+
+def test_local_mlflow_can_attach_existing_run(tmp_path: Path):
+    database = tmp_path / "mlflow.db"
+    logger_config = {
+        "type": "mlflow",
+        "tracking_uri": f"sqlite:///{database}",
+        "artifact_location": f"file:{tmp_path / 'mlartifacts'}",
+        "experiment_name": "tmp",
+        "run_name": "initial",
+    }
+    logger = build_logger({"log_dir": str(tmp_path / "logs"), "logger": logger_config})
+    run_id = logger.run_id
+    logger.finalize("success")
+
+    attached = build_logger(
+        {"log_dir": str(tmp_path / "logs"), "logger": logger_config},
+        run_id=run_id,
+    )
+
+    assert attached.run_id == run_id
+    attached.experiment.log_metric(run_id, "resumed/loss", 0.5, step=1)
+    attached.finalize("success")
+
+    run = attached.experiment.get_run(run_id)
+    assert run.data.metrics["resumed/loss"] == 0.5
