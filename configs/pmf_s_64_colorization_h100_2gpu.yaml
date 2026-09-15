@@ -1,0 +1,70 @@
+seed: 42
+experiment_name: pMF-S-4-64-colorization-h100-2gpu
+
+model:
+  resolution: 64
+  patch_size: 4
+  in_channels: 3
+  out_channels: 2
+  hidden_size: 512
+  depth: 16
+  num_heads: 8
+  mlp_ratio: 2.6666666666666665
+  aux_head_depth: 8
+  pca_channels: 128
+  num_time_tokens: 4
+  weight_init_constant: 0.32
+
+data:
+  train_manifest: /mnt/IMAGING/HUB/DATASETS/general_datasets/faces/ffhq/ffhq.txt
+  val_manifest: null
+  train_root: null
+  val_root: /mnt/IMAGING/HUB/DATASETS/general_datasets/faces/test_faces
+  resolution: [64, 64]
+  batch_size: 10
+  val_batch_size: 4
+  num_workers: 8
+  horizontal_flip: true
+  resize_strategy: center_crop
+
+training:
+  accelerator: auto
+  devices: 2
+  precision: bf16-mixed
+  max_epochs: 320
+  max_steps: null
+  validation_check_interval_steps: null
+  log_every_n_steps: 1
+  global_batch_size_target: 1280
+  accumulate_grad_batches: 64
+  optimizer: muon
+  learning_rate: 0.001
+  adam_b2: 0.95
+  weight_decay: 0.0
+  warmup_steps: 0
+  lr_schedule: constant
+  auxiliary_weight: 1.0
+  noise_scale: 0.25
+  norm_p: 1.0
+  norm_eps: 0.01
+  time_sampling: {p_mean: 0.8, p_std: 0.8, data_proportion: 0.5, tr_uniform: false, uniform_probability: 0.1}
+  perceptual:
+    max_t: 0.8
+    lpips: {enabled: false, weight: 0.0}
+    convnext: {enabled: false, weight: 0.0}
+  gradient_clip_val: 0.0
+  checkpoint_dir: checkpoints/pmf_s_4_64_h100_2gpu
+  log_dir: logs
+  logger: {type: mlflow, tracking_uri: sqlite:///./mlflow.db, artifact_location: file:./mlartifacts, experiment_name: ColorMF, run_name: pMF-S-4-64-colorization-h100-2gpu, log_model: false}
+  sample_dir: qualitative/pmf_s_4_64_h100_2gpu
+  sync_batchnorm: false
+  ema:
+    enabled: true
+    type: edm
+    half_lives_kimg: [500]
+    validation_variant: "500"
+    update_after_step: 0
+    update_every: 1
+    use_for_validation: true
+
+validation: {image_ids: [], image_count: 4, sample_seeds: [1, 2, 3, 4]}

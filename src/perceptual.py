@@ -8,6 +8,9 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from kornia.color import lab_to_rgb
+import lpips
+from transformers import ConvNextV2Model
 
 from .lab import denormalize_L, denormalize_ab
 
@@ -19,15 +22,8 @@ def normalized_lab_to_rgb(L: Tensor, ab: Tensor) -> Tensor:
     silently using its default hard RGB clipping would discard out-of-gamut
     gradients before they reach predicted chroma.
     """
-    try:
-        from kornia.color import lab_to_rgb
-    except ImportError as error:
-        raise RuntimeError("Kornia is required for perceptual LAB-to-RGB training") from error
     lab_physical = torch.cat([denormalize_L(L), denormalize_ab(ab)], dim=1)
-    try:
-        return lab_to_rgb(lab_physical, clip=False)
-    except TypeError as error:
-        raise RuntimeError("installed Kornia lab_to_rgb must support clip=False") from error
+    return lab_to_rgb(lab_physical, clip=False)
 
 
 def paired_random_resized_crop(x1: Tensor, x2: Tensor, out_size: int = 224,
@@ -76,17 +72,9 @@ class PerceptualLosses:
                  lpips_network: Optional[nn.Module] = None,
                  convnext_network: Optional[nn.Module] = None):
         if use_lpips and lpips_network is None:
-            try:
-                import lpips
-            except ImportError as error:
-                raise RuntimeError("lpips is required when LPIPS loss is enabled") from error
             # lpips_j used by official pMF implements the VGG16 backend.
             lpips_network = lpips.LPIPS(net="vgg")
         if use_convnext and convnext_network is None:
-            try:
-                from transformers import ConvNextV2Model
-            except ImportError as error:
-                raise RuntimeError("transformers is required for ConvNeXt perceptual loss") from error
             convnext_network = ConvNextV2Model.from_pretrained(
                 "facebook/convnextv2-base-22k-224")
         self.lpips = lpips_network if use_lpips else None

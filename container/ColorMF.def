@@ -1,0 +1,30 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+%files
+    requirements.txt /opt/colormf/requirements.txt
+
+%environment
+    export PATH=/opt/conda/bin:$PATH
+    export PYTHONNOUSERSITE=1
+    export TOKENIZERS_PARALLELISM=false
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1
+    rm -rf /var/lib/apt/lists/*
+
+    python -m pip install --upgrade pip
+    grep -Ev '^(torch|torchvision)([<>=~]|$)' \
+        /opt/colormf/requirements.txt > /tmp/colormf-requirements.txt
+    python -m pip install --no-cache-dir -r /tmp/colormf-requirements.txt
+    rm -rf /root/.cache/pip /tmp/colormf-requirements.txt
+
+%runscript
+    exec python "$@"

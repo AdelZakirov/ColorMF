@@ -42,6 +42,7 @@ training:
   warmup_steps: 0
   lr_schedule: constant
   auxiliary_weight: 1.0
+  noise_scale: 0.5
   norm_p: 1.0
   norm_eps: 0.01
   time_sampling: {p_mean: 0.8, p_std: 0.8, data_proportion: 0.5, tr_uniform: false, uniform_probability: 0.1}

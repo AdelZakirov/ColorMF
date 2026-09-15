@@ -146,6 +146,36 @@ Training-step metrics are sent to MLflow every optimizer step by default via
 `training.log_every_n_steps: 1`; increase this value only when reducing metric
 history volume is more important than a dense loss curve.
 
+Training can resume both the Lightning checkpoint state and an existing MLflow
+run. Pass the checkpoint and run ID explicitly; the MLflow tracking URI comes
+from the config:
+
+```bash
+./.venv/bin/python train.py \
+  --config configs/pmf_s_64_colorization.yaml \
+  --resume checkpoints/pmf_s_4_64/last.ckpt \
+  --mlflow-run-id 47b32d0328924e1baa571351a54a6136
+```
+
+The run ID can also be set as `training.logger.run_id` in YAML. The CLI value
+takes precedence. When attaching an existing run, the launcher does not log
+the flattened config parameters again because MLflow parameters are immutable;
+runtime metadata tags and new metrics continue in the same run.
+
+The mathematically equivalent diagonal optimization is controlled by
+`training.split_diagonal_jvp`; it avoids JVP work for samples where `r == t`
+and defaults to `false`. On the current RTX 4090 S-model benchmark (batch 20,
+BF16), it measured `0.2108 s/step` versus `0.1894 s/step` for the legacy path,
+so it remains an A/B option rather than the default.
+
+An experimental compile path is available with
+`training.compile_mode: max-autotune-no-cudagraphs`. It compiles the model
+forward and auxiliary direction in place, preserving checkpoint parameter
+names. Leave it `null` for the eager baseline until a representative run has
+confirmed wall-clock and memory behavior. On the same benchmark, compiled
+legacy measured `0.191 s/step` after a `45.2 s` compile, while compiled split
+measured `0.241 s/step` after a `157.6 s` compile.
+
 ## Audit map
 
 | Official pMF component | ColorMF implementation | adaptation and reason |

@@ -340,7 +340,10 @@ class PixelMeanFlowB(nn.Module):
     @torch.no_grad()
     def sample(self, L: Tensor, *, seed: Optional[int] = None,
                seeds: Optional[Sequence[int]] = None,
-               image_ids: Optional[Sequence[str]] = None) -> Tensor:
+               image_ids: Optional[Sequence[str]] = None,
+               noise_scale: float = 1.0) -> Tensor:
+        if not math.isfinite(float(noise_scale)) or noise_scale <= 0:
+            raise ValueError("noise_scale must be a finite positive number")
         if seed is None and seeds is None:
             seed = 0
         if seed is not None and seeds is not None:
@@ -360,7 +363,9 @@ class PixelMeanFlowB(nn.Module):
         for image_id, requested_seed in zip(ids, requested):
             generator = torch.Generator(device="cpu")
             generator.manual_seed(self._stable_seed(image_id, requested_seed))
-            noise.append(torch.randn((1, 2, *self.resolution), generator=generator))
+            noise.append(noise_scale * torch.randn(
+                (1, 2, *self.resolution), generator=generator
+            ))
         z_t = torch.cat(noise).to(device=L.device, dtype=L.dtype)
         t = torch.ones(z_t.shape[0], device=L.device, dtype=L.dtype)
         r = torch.zeros_like(t)

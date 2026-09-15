@@ -55,6 +55,19 @@ class SamplingTests(unittest.TestCase):
         self.assertTrue(torch.equal(first, second))
         self.assertFalse(torch.equal(first, other))
 
+    def test_noise_scale_is_applied_to_sampling_prior(self):
+        model = PixelMeanFlowB(
+            resolution=16, patch_size=4, hidden_size=32, depth=2, heads=4,
+            aux_head_depth=1, pca_channels=8
+        ).eval()
+        model.forward = lambda z, L, r, t, return_velocity=False: (torch.zeros_like(z), None)
+        L = torch.zeros(1, 1, 16, 16)
+        sample = model.sample(L, seed=42, image_ids=["image-a"], noise_scale=0.25)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(model._stable_seed("image-a", 42))
+        expected = 0.25 * torch.randn((1, 2, 16, 16), generator=generator)
+        torch.testing.assert_close(sample, expected)
+
     def test_seed_batch_matches_individual_sampling(self):
         model = PixelMeanFlowB(
             resolution=16, patch_size=4, hidden_size=32, depth=2, heads=4,

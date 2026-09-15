@@ -12,28 +12,10 @@ from src.lab import lab_to_rgb, rgb_to_lab
 from src.lightning_module import PMFColorizerModule
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/pilot.yaml")
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--no-ema",
-        action="store_true",
-        help="use raw checkpoint weights even when EMA weights are available",
-    )
-    parser.add_argument(
-        "--ema-variant",
-        default=None,
-        help="EDM half-life in kimg (500, 1000, or 2000); defaults to config",
-    )
-    args = parser.parse_args()
-
-    with open(args.config, "r", encoding="utf-8") as handle:
+def load_module(config_filename: str, checkpoint_filename: str):
+    with open(config_filename, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(checkpoint_filename, map_location="cpu")
     ema_config = config["training"].get("ema") or {}
     checkpoint_ema = checkpoint.get("ema") or {}
     module = PMFColorizerModule(
@@ -48,6 +30,7 @@ def main():
         adam_b2=config["training"].get("adam_b2", 0.95),
         lr_schedule=config["training"].get("lr_schedule", "constant"),
         ema_enabled=ema_config.get("enabled", True),
+        noise_scale=config["training"].get("noise_scale", 1.0),
         ema_type=checkpoint_ema.get(
             "ema_type",
             "fixed" if "shadow" in checkpoint_ema else ema_config.get("type", "edm"),
@@ -69,23 +52,53 @@ def main():
     )
     state_dict = checkpoint.get("state_dict", checkpoint)
     module.load_state_dict(state_dict)
+    module.eval()
+
+    return module, config, checkpoint
+
+
+def prepare_input(input_filename: str, resolution: tuple[int, int]):
+    image = cv2.imread(input_filename, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(input_filename)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    height, width = resolution
+    if image.shape[:2] != (height, width):
+        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_CUBIC)
+    L, _ = rgb_to_lab(image)
+
+    return image, L
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/pilot.yaml")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--no-ema",
+        action="store_true",
+        help="use raw checkpoint weights even when EMA weights are available",
+    )
+    parser.add_argument(
+        "--ema-variant",
+        default=None,
+        help="EDM half-life in kimg (500, 1000, or 2000); defaults to config",
+    )
+    args = parser.parse_args()
+
+    module, config, checkpoint = load_module(args.config, args.checkpoint)
     if not args.no_ema:
         module.load_ema_state_dict(checkpoint.get("ema"))
-    module.eval()
-    image = cv2.imread(args.input, cv2.IMREAD_COLOR)
-    if image is None:
-        raise FileNotFoundError(args.input)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    size = module.model.resolution
-    if image.shape[:2] != size:
-        image = cv2.resize(
-            image, (size[1], size[0]), interpolation=cv2.INTER_CUBIC
-        )
-    L, _ = rgb_to_lab(image)
+    image, L = prepare_input(args.input, module.model.resolution)
     L = L.unsqueeze(0)
-    ema_variant = args.ema_variant or ema_config.get("validation_variant")
+    ema_variant = args.ema_variant or config["training"].get("ema", {}).get(
+        "validation_variant"
+    )
     with module.ema_scope(ema_variant):
-        generated = module.model.sample(L, seed=args.seed)
+        generated = module.sample(L, seed=args.seed)
         rgb = lab_to_rgb(L, generated)[0]
     cv2.imwrite(args.output, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 

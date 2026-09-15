@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -107,22 +108,103 @@ def _adaptive_values(values: Tensor, norm_p: float, norm_eps: float) -> Tensor:
     return values.float() / (values.float() + norm_eps).pow(norm_p).detach()
 
 
+def _auxiliary_direction(model: Callable, z: Tensor, L: Tensor, t: Tensor) -> Tensor:
+    direction_fn = getattr(model, "auxiliary_direction", None)
+    if direction_fn is None:
+        return model(z, L, t, t)[1]
+    return direction_fn(z, L, t)
+
+
+def _split_diagonal_predictions(
+    model: Callable, z: Tensor, L: Tensor, r: Tensor, t: Tensor
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    diagonal = torch.eq(r, t)
+    diagonal_indices = diagonal.nonzero(as_tuple=True)[0]
+    off_diagonal_indices = (~diagonal).nonzero(as_tuple=True)[0]
+
+    u_prediction = torch.zeros_like(z)
+    velocity_prediction = torch.zeros_like(z)
+    jvp_direction = torch.zeros_like(z)
+    average_velocity_jvp = torch.zeros_like(z)
+
+    if diagonal_indices.numel():
+        u_diagonal, v_diagonal = model(
+            z[diagonal_indices],
+            L[diagonal_indices],
+            r[diagonal_indices],
+            t[diagonal_indices],
+        )
+        u_prediction = u_prediction.index_copy(0, diagonal_indices, u_diagonal)
+        velocity_prediction = velocity_prediction.index_copy(
+            0, diagonal_indices, v_diagonal
+        )
+        jvp_direction = jvp_direction.index_copy(
+            0, diagonal_indices, v_diagonal.detach()
+        )
+
+    if off_diagonal_indices.numel():
+        z_off = z[off_diagonal_indices]
+        L_off = L[off_diagonal_indices]
+        r_off = r[off_diagonal_indices]
+        t_off = t[off_diagonal_indices]
+        with torch.no_grad():
+            direction_off = _auxiliary_direction(model, z_off, L_off, t_off)
+
+        def u_with_aux(z_value: Tensor, t_value: Tensor, r_value: Tensor):
+            u_value, v_value = model(z_value, L_off, r_value, t_value)
+            return u_value, v_value
+
+        u_off, jvp_off, v_off = torch.func.jvp(
+            u_with_aux,
+            (z_off, t_off, r_off),
+            (
+                direction_off.detach(),
+                torch.ones_like(t_off),
+                torch.zeros_like(r_off),
+            ),
+            has_aux=True,
+        )
+        u_prediction = u_prediction.index_copy(0, off_diagonal_indices, u_off)
+        velocity_prediction = velocity_prediction.index_copy(
+            0, off_diagonal_indices, v_off
+        )
+        jvp_direction = jvp_direction.index_copy(
+            0, off_diagonal_indices, direction_off
+        )
+        average_velocity_jvp = average_velocity_jvp.index_copy(
+            0, off_diagonal_indices, jvp_off
+        )
+
+    return (
+        u_prediction,
+        average_velocity_jvp,
+        velocity_prediction,
+        jvp_direction,
+    )
+
+
 def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Tensor] = None,
                    r: Optional[Tensor] = None, t: Optional[Tensor] = None,
                    generator: Optional[torch.Generator] = None, auxiliary_weight: float = 1.0,
+                   noise_scale: float = 1.0,
                    adaptive_power: float = 1.0, adaptive_epsilon: float = 0.01,
                    p_mean: float = 0.8, p_std: float = 0.8, data_proportion: float = 0.5,
                    tr_uniform: bool = False, uniform_probability: float = 0.1,
                    perceptual_fn: Optional[Callable[..., tuple[Tensor, Tensor]]] = None,
                    lpips_weight: float = 0.0, convnext_weight: float = 0.0,
-                   perceptual_max_t: float = 0.8) -> MeanFlowTerms:
+                   perceptual_max_t: float = 0.8,
+                   split_diagonal_jvp: bool = False) -> MeanFlowTerms:
     """Evaluate official pMF training math for stochastic chroma state only."""
     if x.ndim != 4 or x.shape[1] != 2:
         raise ValueError("x must be stochastic ab state [B,2,H,W]")
     if L.shape != (x.shape[0], 1, *x.shape[-2:]):
         raise ValueError("L must be fixed [B,1,H,W]")
+    if not math.isfinite(float(noise_scale)) or noise_scale <= 0:
+        raise ValueError("noise_scale must be a finite positive number")
     if noise is None:
-        noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
+        noise = noise_scale * torch.randn(
+            x.shape, device=x.device, dtype=x.dtype, generator=generator
+        )
     if r is None or t is None:
         sampled_r, sampled_t = sample_rt(
             x.shape[0], x.device, dtype=x.dtype, generator=generator, p_mean=p_mean,
@@ -134,22 +216,27 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
     z = interpolate(x, noise, t)
     target = stabilized_velocity_target(x, noise, z, t).detach()
 
-    with torch.no_grad():
-        direction_fn = getattr(model, "auxiliary_direction", None)
-        if direction_fn is None:
-            _, v_direction = model(z, L, t, t)
-        else:
-            v_direction = direction_fn(z, L, t)
-    if v_direction is None:
-        raise RuntimeError("training requires the deep v branch")
+    if split_diagonal_jvp and torch.any(torch.eq(r, t)) and torch.any(torch.ne(r, t)):
+        u, jvp, v, v_direction = _split_diagonal_predictions(model, z, L, r, t)
+    elif split_diagonal_jvp and torch.all(torch.eq(r, t)):
+        u, v = model(z, L, r, t)
+        v_direction = v.detach()
+        jvp = torch.zeros_like(u)
+    else:
+        with torch.no_grad():
+            v_direction = _auxiliary_direction(model, z, L, t)
+        if v_direction is None:
+            raise RuntimeError("training requires the deep v branch")
 
-    def u_with_aux(z_value: Tensor, t_value: Tensor, r_value: Tensor):
-        u_value, v_value = model(z_value, L, r_value, t_value)
-        return u_value, v_value
+        def u_with_aux(z_value: Tensor, t_value: Tensor, r_value: Tensor):
+            u_value, v_value = model(z_value, L, r_value, t_value)
+            return u_value, v_value
 
-    u, jvp, v = torch.func.jvp(
-        u_with_aux, (z, t, r),
-        (v_direction.detach(), torch.ones_like(t), torch.zeros_like(r)), has_aux=True)
+        u, jvp, v = torch.func.jvp(
+            u_with_aux, (z, t, r),
+            (v_direction.detach(), torch.ones_like(t), torch.zeros_like(r)),
+            has_aux=True,
+        )
     corrected = u + (t.float() - r.float()).reshape(-1, 1, 1, 1) * jvp.detach()
     loss_u, loss_u_examples, mse_u = _adaptive_loss(
         corrected - target, adaptive_power, adaptive_epsilon)

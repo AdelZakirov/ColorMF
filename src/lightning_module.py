@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence
@@ -71,6 +72,7 @@ class PMFColorizerModule(pl.LightningModule):
         adam_b2: float = 0.95,
         lr_schedule: str = "constant",
         auxiliary_weight: float = 1.0,
+        noise_scale: float = 1.0,
         norm_p: float = 1.0,
         norm_eps: float = 0.01,
         time_p_mean: float = 0.8,
@@ -78,6 +80,7 @@ class PMFColorizerModule(pl.LightningModule):
         time_data_proportion: float = 0.5,
         time_tr_uniform: bool = False,
         time_uniform_probability: float = 0.1,
+        split_diagonal_jvp: bool = False,
         random_seed: int = 1234,
         fixed_validation_ids: Optional[Iterable[str]] = None,
         validation_image_count: int = 4,
@@ -111,11 +114,15 @@ class PMFColorizerModule(pl.LightningModule):
         self.lr_schedule = lr_schedule
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.noise_scale = float(noise_scale)
+        if not math.isfinite(self.noise_scale) or self.noise_scale <= 0:
+            raise ValueError("noise_scale must be a finite positive number")
         self.time_p_mean = time_p_mean
         self.time_p_std = time_p_std
         self.time_data_proportion = time_data_proportion
         self.time_tr_uniform = time_tr_uniform
         self.time_uniform_probability = time_uniform_probability
+        self.split_diagonal_jvp = bool(split_diagonal_jvp)
         self.random_seed = random_seed
         self.fixed_validation_ids = set(fixed_validation_ids or [])
         self.validation_image_count = max(0, int(validation_image_count))
@@ -177,10 +184,12 @@ class PMFColorizerModule(pl.LightningModule):
 
     @torch.no_grad()
     def sample(self, L: torch.Tensor, **kwargs) -> torch.Tensor:
+        kwargs.setdefault("noise_scale", self.noise_scale)
         return self.model.sample(L, **kwargs)
 
     @torch.no_grad()
     def sample_lab(self, L: torch.Tensor, **kwargs) -> torch.Tensor:
+        kwargs.setdefault("noise_scale", self.noise_scale)
         return self.model.sample_lab(L, **kwargs)
 
     def training_step(self, batch: dict, batch_idx: int):
@@ -194,6 +203,7 @@ class PMFColorizerModule(pl.LightningModule):
             batch["ab"],
             batch["L"],
             auxiliary_weight=self.auxiliary_weight,
+            noise_scale=self.noise_scale,
             adaptive_power=self.norm_p,
             adaptive_epsilon=self.norm_eps,
             generator=self._train_generator,
@@ -206,6 +216,7 @@ class PMFColorizerModule(pl.LightningModule):
             lpips_weight=self.lpips_weight if self.lpips_enabled else 0.0,
             convnext_weight=self.convnext_weight if self.convnext_enabled else 0.0,
             perceptual_max_t=self.perceptual_max_t,
+            split_diagonal_jvp=self.split_diagonal_jvp,
         )
         batch_size = batch["ab"].shape[0]
         world_size = int(getattr(self.trainer, "world_size", 1))
@@ -345,6 +356,7 @@ class PMFColorizerModule(pl.LightningModule):
             batch["ab"],
             batch["L"],
             auxiliary_weight=self.auxiliary_weight,
+            noise_scale=self.noise_scale,
             adaptive_power=self.norm_p,
             adaptive_epsilon=self.norm_eps,
             generator=self._validation_generator,
@@ -357,6 +369,7 @@ class PMFColorizerModule(pl.LightningModule):
             lpips_weight=self.lpips_weight if self.lpips_enabled else 0.0,
             convnext_weight=self.convnext_weight if self.convnext_enabled else 0.0,
             perceptual_max_t=self.perceptual_max_t,
+            split_diagonal_jvp=self.split_diagonal_jvp,
         )
         for index, image_id in enumerate(batch["image_id"]):
             image_id = str(image_id)
@@ -446,7 +459,7 @@ class PMFColorizerModule(pl.LightningModule):
             artifact_path = f"{self.sample_dir.rstrip('/')}/current"
             for image_id, (L, gt) in visuals.items():
                 device = self.device
-                generated = self.model.sample(
+                generated = self.sample(
                     L.to(device),
                     seeds=self.validation_sample_seeds,
                     image_ids=[image_id],
@@ -503,11 +516,13 @@ class PMFColorizerModule(pl.LightningModule):
             "warmup_steps": "warmup_steps", "max_steps": "max_steps",
             "optimizer": "optimizer_name", "adam_b2": "adam_b2",
             "lr_schedule": "lr_schedule", "auxiliary_weight": "auxiliary_weight",
+            "noise_scale": "noise_scale",
             "norm_p": "norm_p", "norm_eps": "norm_eps",
             "time_p_mean": "time_p_mean", "time_p_std": "time_p_std",
             "time_data_proportion": "time_data_proportion",
             "time_tr_uniform": "time_tr_uniform",
             "time_uniform_probability": "time_uniform_probability",
+            "split_diagonal_jvp": "split_diagonal_jvp",
             "random_seed": "random_seed", "ema_decay": "ema_decay",
             "ema_type": "ema_type", "ema_half_lives_kimg": "ema_half_lives_kimg",
             "ema_update_after_step": "ema_update_after_step",

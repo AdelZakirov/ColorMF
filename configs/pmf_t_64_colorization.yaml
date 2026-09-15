@@ -21,10 +21,10 @@ data:
   train_root: null
   val_root: /home/AZA/datasets/test_faces
   resolution: [64, 64]
-  batch_size: 32
+  batch_size: 24
   val_batch_size: 4
-  num_workers: 8
-  horizontal_flip: false
+  num_workers: 4
+  horizontal_flip: true
   resize_strategy: center_crop
 
 training:
@@ -33,8 +33,11 @@ training:
   precision: bf16-mixed
   max_epochs: 320
   max_steps: null
-  global_batch_size_target: 1024
-  accumulate_grad_batches: 128
+  validation_check_interval_steps: null
+  log_every_n_steps: 1
+  compile_mode: null
+  global_batch_size_target: 48
+  accumulate_grad_batches: 2
   optimizer: muon
   learning_rate: 0.001
   adam_b2: 0.95
@@ -42,24 +45,26 @@ training:
   warmup_steps: 0
   lr_schedule: constant
   auxiliary_weight: 1.0
+  noise_scale: 0.15
+  split_diagonal_jvp: false
   norm_p: 1.0
   norm_eps: 0.01
   time_sampling: {p_mean: 0.8, p_std: 0.8, data_proportion: 0.5, tr_uniform: false, uniform_probability: 0.1}
   perceptual:
     max_t: 0.8
-    lpips: {enabled: true, weight: 0.4}
-    convnext: {enabled: true, weight: 0.1}
+    lpips: {enabled: false, weight: 0.4}
+    convnext: {enabled: false, weight: 0.1}
   gradient_clip_val: 0.0
-  checkpoint_dir: checkpoints/pmf_b_4_64
+  checkpoint_dir: checkpoints/pmf_t_4_64
   log_dir: logs
-  logger: {type: mlflow, tracking_uri: sqlite:///./mlflow.db, artifact_location: file:./mlartifacts, experiment_name: ColorMF, run_name: pMF-B-4-64-colorization, log_model: false}
-  sample_dir: qualitative/pmf_b_4_64
+  logger: {type: mlflow, tracking_uri: sqlite:///./mlflow.db, artifact_location: file:./mlartifacts, experiment_name: ColorMF, run_name: pMF-T-4-64-colorization, log_model: false}
+  sample_dir: qualitative/pmf_t_4_64
   sync_batchnorm: false
   ema:
     enabled: true
     type: edm
-    half_lives_kimg: [500, 1000, 2000]
-    validation_variant: "1000"
+    half_lives_kimg: [500]
+    validation_variant: "500"
     update_after_step: 0
     update_every: 1
     use_for_validation: true

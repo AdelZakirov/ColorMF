@@ -94,6 +94,53 @@ def test_production_matches_independent_reference_and_gradients():
         torch.testing.assert_close(left.grad, right.grad)
 
 
+def test_generated_noise_uses_configured_scale():
+    x = torch.zeros(1, 2, 2, 2)
+    L = torch.zeros(1, 1, 2, 2)
+    seed = 17
+    terms = meanflow_terms(
+        ToyModel(), x, L, noise_scale=0.25,
+        generator=torch.Generator().manual_seed(seed),
+        r=torch.zeros(1), t=torch.ones(1),
+    )
+    expected = 0.25 * torch.randn(
+        x.shape, generator=torch.Generator().manual_seed(seed)
+    )
+    torch.testing.assert_close(terms.z, expected)
+
+
+def test_diagonal_split_matches_legacy_objective_and_gradients():
+    torch.manual_seed(14)
+    x, L = torch.randn(3, 2, 3, 3), torch.randn(3, 1, 3, 3)
+    noise = torch.randn_like(x)
+    r = torch.tensor([0.2, 0.3, 0.6])
+    t = torch.tensor([0.2, 0.8, 0.9])
+    split_model, legacy_model = ToyModel(), ToyModel()
+    legacy_model.load_state_dict(split_model.state_dict())
+    split = meanflow_terms(
+        split_model, x, L, noise=noise, r=r, t=t, split_diagonal_jvp=True
+    )
+    legacy = meanflow_terms(
+        legacy_model, x, L, noise=noise, r=r, t=t, split_diagonal_jvp=False
+    )
+
+    for left, right in (
+        (split.u_prediction, legacy.u_prediction),
+        (split.velocity_prediction, legacy.velocity_prediction),
+        (split.jvp_direction, legacy.jvp_direction),
+        (split.corrected_velocity, legacy.corrected_velocity),
+        (split.main_loss, legacy.main_loss),
+        (split.auxiliary_loss, legacy.auxiliary_loss),
+        (split.total_loss, legacy.total_loss),
+    ):
+        torch.testing.assert_close(left, right)
+    assert torch.count_nonzero(split.average_velocity_jvp[0]) == 0
+    split.total_loss.backward()
+    legacy.total_loss.backward()
+    for left, right in zip(split_model.parameters(), legacy_model.parameters()):
+        torch.testing.assert_close(left.grad, right.grad)
+
+
 def test_l_is_closed_over_not_a_jvp_primal():
     x = torch.randn(1, 2, 2, 2)
     L = torch.randn(1, 1, 2, 2, requires_grad=True)

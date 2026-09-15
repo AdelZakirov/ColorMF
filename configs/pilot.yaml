@@ -39,6 +39,7 @@ training:
   weight_decay: 0.0001
   warmup_steps: 1000
   auxiliary_weight: 1.0
+  noise_scale: 0.5
   time_sampling:
     # Official pMF 256px B/16 logit-normal preset.
     p_mean: 0.8
