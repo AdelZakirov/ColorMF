@@ -44,6 +44,11 @@ training:
   lr_schedule: constant
   auxiliary_weight: 1.0
   noise_scale: 0.5
+  edge_loss:
+    enabled: false
+    weight: 0.02
+    boundary_boost: 4.0
+    max_t: 1.0
   norm_p: 1.0
   norm_eps: 0.01
   time_sampling: {p_mean: 0.8, p_std: 0.8, data_proportion: 0.5, tr_uniform: false, uniform_probability: 0.1}

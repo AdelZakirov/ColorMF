@@ -1,8 +1,13 @@
 from pathlib import Path
 
 import mlflow
+import torch
 
-from src.lightning_module import PMFColorizerModule, _select_validation_visuals
+from src.lightning_module import (
+    PMFColorizerModule,
+    _mean_active_values,
+    _select_validation_visuals,
+)
 from train import build_logger, log_mlflow_metadata
 
 
@@ -20,6 +25,20 @@ def test_validation_visual_selection_preserves_requested_ids():
     selected = _select_validation_visuals(visuals, {"image-m", "missing"}, 2)
 
     assert list(selected) == ["image-m"]
+
+
+def test_validation_edge_metric_averages_only_active_examples():
+    values = torch.tensor([2.0, 0.0, 4.0, 0.0])
+    active = torch.tensor([True, False, True, False])
+
+    torch.testing.assert_close(
+        _mean_active_values(values, active),
+        torch.tensor(3.0),
+    )
+    torch.testing.assert_close(
+        _mean_active_values(values, torch.zeros_like(active)),
+        torch.tensor(0.0),
+    )
 
 
 def test_local_mlflow_logs_run_data_and_artifact(tmp_path: Path):

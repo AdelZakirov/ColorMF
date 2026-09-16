@@ -19,7 +19,7 @@ from .ema import EMAManager
 from .model import PixelMeanFlowB
 from .optimizer import Muon
 from .perceptual import PerceptualLosses
-from .pmf import meanflow_terms
+from .pmf import _validate_edge_loss_parameters, meanflow_terms
 
 
 def _save_qualitative_row(
@@ -57,6 +57,14 @@ def _select_validation_visuals(
             if image_id in visuals
         }
     return dict(sorted(visuals.items())[:validation_image_count])
+
+
+def _mean_active_values(values: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+    """Average a raw validation metric over eligible examples only."""
+    active = active.to(device=values.device, dtype=torch.bool)
+    if torch.any(active):
+        return values[active].mean()
+    return values.sum() * 0.0
 
 
 class PMFColorizerModule(pl.LightningModule):
@@ -98,8 +106,15 @@ class PMFColorizerModule(pl.LightningModule):
         convnext_enabled: bool = False,
         convnext_weight: float = 0.1,
         perceptual_max_t: float = 0.8,
+        edge_loss_enabled: bool = False,
+        edge_loss_weight: float = 0.02,
+        edge_boundary_boost: float = 4.0,
+        edge_max_t: float = 1.0,
         sample_dir: str = "qualitative",
     ):
+        edge_loss_weight, edge_boundary_boost, edge_max_t = _validate_edge_loss_parameters(
+            edge_loss_weight, edge_boundary_boost, edge_max_t
+        )
         super().__init__()
         model_config = model or {}
         self.save_hyperparameters()
@@ -160,6 +175,10 @@ class PMFColorizerModule(pl.LightningModule):
         self.convnext_enabled = convnext_enabled
         self.convnext_weight = convnext_weight
         self.perceptual_max_t = perceptual_max_t
+        self.edge_loss_enabled = bool(edge_loss_enabled)
+        self.edge_loss_weight = edge_loss_weight
+        self.edge_boundary_boost = edge_boundary_boost
+        self.edge_max_t = edge_max_t
         self._perceptual_losses: Optional[PerceptualLosses] = None
         self._pending_ema_state: Optional[dict] = None
         self._ema_validation_applied = False
@@ -217,6 +236,10 @@ class PMFColorizerModule(pl.LightningModule):
             convnext_weight=self.convnext_weight if self.convnext_enabled else 0.0,
             perceptual_max_t=self.perceptual_max_t,
             split_diagonal_jvp=self.split_diagonal_jvp,
+            edge_loss_enabled=self.edge_loss_enabled,
+            edge_loss_weight=self.edge_loss_weight,
+            edge_boundary_boost=self.edge_boundary_boost,
+            edge_max_t=self.edge_max_t,
         )
         batch_size = batch["ab"].shape[0]
         world_size = int(getattr(self.trainer, "world_size", 1))
@@ -251,6 +274,15 @@ class PMFColorizerModule(pl.LightningModule):
         if self.convnext_enabled:
             self.log("train/convnext_loss", terms.perceptual_convnext_loss,
                      on_step=True, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        if self.edge_loss_enabled:
+            self.log(
+                "train/chroma_edge_loss",
+                terms.chroma_edge_loss,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
         self.log(
             "train/raw_main_velocity_mse",
             terms.main_velocity_mse_per_example.mean(),
@@ -370,6 +402,10 @@ class PMFColorizerModule(pl.LightningModule):
             convnext_weight=self.convnext_weight if self.convnext_enabled else 0.0,
             perceptual_max_t=self.perceptual_max_t,
             split_diagonal_jvp=self.split_diagonal_jvp,
+            edge_loss_enabled=self.edge_loss_enabled,
+            edge_loss_weight=self.edge_loss_weight,
+            edge_boundary_boost=self.edge_boundary_boost,
+            edge_max_t=self.edge_max_t,
         )
         for index, image_id in enumerate(batch["image_id"]):
             image_id = str(image_id)
@@ -382,6 +418,8 @@ class PMFColorizerModule(pl.LightningModule):
                     .detach()
                     .cpu()
                 ),
+                float(terms.chroma_edge_loss_per_example[index].detach().cpu()),
+                float((terms.t[index] <= self.edge_max_t).detach().cpu()),
             )
             should_capture = (
                 image_id in self.fixed_validation_ids
@@ -453,6 +491,15 @@ class PMFColorizerModule(pl.LightningModule):
                     sync_dist=False,
                     rank_zero_only=True,
                 )
+                if self.edge_loss_enabled:
+                    self.log(
+                        "val/chroma_edge_loss",
+                        _mean_active_values(values[:, 4], values[:, 5]),
+                        on_step=False,
+                        on_epoch=True,
+                        sync_dist=False,
+                        rank_zero_only=True,
+                    )
             output_dir = (
                 Path(self.trainer.default_root_dir) / self.sample_dir / "current"
             )
@@ -523,6 +570,10 @@ class PMFColorizerModule(pl.LightningModule):
             "time_tr_uniform": "time_tr_uniform",
             "time_uniform_probability": "time_uniform_probability",
             "split_diagonal_jvp": "split_diagonal_jvp",
+            "edge_loss_enabled": "edge_loss_enabled",
+            "edge_loss_weight": "edge_loss_weight",
+            "edge_boundary_boost": "edge_boundary_boost",
+            "edge_max_t": "edge_max_t",
             "random_seed": "random_seed", "ema_decay": "ema_decay",
             "ema_type": "ema_type", "ema_half_lives_kimg": "ema_half_lives_kimg",
             "ema_update_after_step": "ema_update_after_step",

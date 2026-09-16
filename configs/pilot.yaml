@@ -41,6 +41,11 @@ training:
   warmup_steps: 1000
   auxiliary_weight: 1.0
   noise_scale: 0.5
+  edge_loss:
+    enabled: false
+    weight: 0.02
+    boundary_boost: 4.0
+    max_t: 1.0
   time_sampling:
     # Official pMF 256px B/16 logit-normal preset.
     p_mean: 0.8

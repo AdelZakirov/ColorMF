@@ -168,6 +168,7 @@ def main():
     validation = config.get("validation", {})
     ema = training.get("ema") or {}
     time_sampling = training.get("time_sampling", {})
+    edge_loss = training.get("edge_loss") or {}
     module = PMFColorizerModule(
         model=model_config,
         learning_rate=training["learning_rate"],
@@ -204,6 +205,10 @@ def main():
         convnext_enabled=training.get("perceptual", {}).get("convnext", {}).get("enabled", False),
         convnext_weight=training.get("perceptual", {}).get("convnext", {}).get("weight", 0.1),
         perceptual_max_t=training.get("perceptual", {}).get("max_t", 0.8),
+        edge_loss_enabled=edge_loss.get("enabled", False),
+        edge_loss_weight=edge_loss.get("weight", 0.02),
+        edge_boundary_boost=edge_loss.get("boundary_boost", 4.0),
+        edge_max_t=edge_loss.get("max_t", 1.0),
         sample_dir=training.get("sample_dir", "qualitative"),
     )
     configure_model_compile(module, training)

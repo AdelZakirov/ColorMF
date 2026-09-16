@@ -1,7 +1,8 @@
+import pytest
 import torch
 from torch import nn
 
-from src.pmf import average_velocity, meanflow_terms
+from src.pmf import _chroma_edge_loss, average_velocity, meanflow_terms
 
 
 class ToyModel(nn.Module):
@@ -190,6 +191,161 @@ def test_perceptual_function_receives_only_samples_below_cutoff():
     assert observed == [(2, 2, 2)]
     assert torch.count_nonzero(terms.perceptual_lpips_loss) == 1
     assert torch.count_nonzero(terms.perceptual_convnext_loss) == 1
+
+
+def test_chroma_edge_loss_matches_boundary_weighted_gradient_l1():
+    predicted = torch.zeros(1, 2, 2, 3)
+    predicted[0, 0] = torch.tensor([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]])
+    target = torch.zeros_like(predicted)
+    luminance = torch.tensor([[[[-1.0, 1.0, -1.0], [-1.0, 1.0, -1.0]]]])
+
+    loss, per_example = _chroma_edge_loss(
+        predicted,
+        target,
+        luminance,
+        torch.tensor([0.5]),
+        enabled=True,
+        boundary_boost=4.0,
+        max_t=0.5,
+    )
+
+    # The a-channel has four unit x-gradients, each at weight 5. There
+    # are eight flattened x-gradient elements across both chroma channels;
+    # the y term is zero, so 0.5 * (20 / 8) = 1.25.
+    torch.testing.assert_close(loss, torch.tensor(1.25))
+    torch.testing.assert_close(per_example, torch.tensor([1.25]))
+
+
+def test_chroma_edge_loss_cutoff_is_inclusive_and_inactive_values_are_zero():
+    predicted = torch.zeros(2, 2, 2, 2)
+    predicted[0, 0, 0, 1] = 1.0
+    predicted[1, 0, 0, 1] = 3.0
+    target = torch.zeros_like(predicted)
+    luminance = torch.zeros(2, 1, 2, 2)
+
+    loss, per_example = _chroma_edge_loss(
+        predicted,
+        target,
+        luminance,
+        torch.tensor([0.5, 0.50001]),
+        enabled=True,
+        boundary_boost=0.0,
+        max_t=0.5,
+    )
+
+    torch.testing.assert_close(loss, torch.tensor(0.25))
+    torch.testing.assert_close(per_example, torch.tensor([0.25, 0.0]))
+
+
+def test_chroma_edge_loss_is_u_only_and_total_uses_raw_weight():
+    torch.manual_seed(21)
+    x, L = torch.randn(2, 2, 3, 3), torch.randn(2, 1, 3, 3)
+    noise, r, t = torch.randn_like(x), torch.tensor([0.2, 0.3]), torch.tensor([0.7, 0.8])
+    model = ToyModel()
+    edge_weight = 0.23
+    terms = meanflow_terms(
+        model,
+        x,
+        L,
+        noise=noise,
+        r=r,
+        t=t,
+        edge_loss_enabled=True,
+        edge_loss_weight=edge_weight,
+        edge_boundary_boost=4.0,
+        edge_max_t=1.0,
+    )
+
+    expected = (
+        terms.main_loss_per_example
+        + terms.auxiliary_loss_per_example
+        + edge_weight * terms.chroma_edge_loss_per_example
+    )
+    torch.testing.assert_close(terms.total_loss_per_example, expected)
+    terms.chroma_edge_loss.backward()
+    assert model.u_scale.grad is not None
+    assert model.v_bias.grad is None
+
+
+def test_disabled_chroma_edge_loss_preserves_existing_objective():
+    torch.manual_seed(22)
+    x, L = torch.randn(2, 2, 3, 3), torch.randn(2, 1, 3, 3)
+    noise, r, t = torch.randn_like(x), torch.tensor([0.2, 0.3]), torch.tensor([0.7, 0.8])
+    baseline_model, disabled_model = ToyModel(), ToyModel()
+    disabled_model.load_state_dict(baseline_model.state_dict())
+    baseline = meanflow_terms(baseline_model, x, L, noise=noise, r=r, t=t)
+    disabled = meanflow_terms(
+        disabled_model,
+        x,
+        L,
+        noise=noise,
+        r=r,
+        t=t,
+        edge_loss_enabled=False,
+    )
+
+    torch.testing.assert_close(disabled.total_loss, baseline.total_loss)
+    torch.testing.assert_close(disabled.total_loss_per_example, baseline.total_loss_per_example)
+    torch.testing.assert_close(disabled.chroma_edge_loss, torch.tensor(0.0))
+    torch.testing.assert_close(disabled.chroma_edge_loss_per_example, torch.zeros(2))
+    disabled.total_loss.backward()
+    baseline.total_loss.backward()
+    for left, right in zip(disabled_model.parameters(), baseline_model.parameters()):
+        torch.testing.assert_close(left.grad, right.grad)
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("edge_loss_weight", float("nan")),
+        ("edge_loss_weight", -0.1),
+        ("edge_boundary_boost", float("inf")),
+        ("edge_boundary_boost", -1.0),
+        ("edge_max_t", -0.1),
+        ("edge_max_t", 1.1),
+    ],
+)
+def test_chroma_edge_loss_validates_configuration(parameter, value):
+    kwargs = {parameter: value}
+    with pytest.raises(ValueError, match=parameter.replace("edge_", "edge_")):
+        meanflow_terms(
+            ToyModel(),
+            torch.randn(1, 2, 2, 2),
+            torch.randn(1, 1, 2, 2),
+            noise=torch.randn(1, 2, 2, 2),
+            r=torch.tensor([0.2]),
+            t=torch.tensor([0.8]),
+            **kwargs,
+        )
+
+
+def test_chroma_edge_loss_no_active_examples_is_differentiable_safe():
+    terms = meanflow_terms(
+        ToyModel(),
+        torch.randn(1, 2, 2, 2),
+        torch.randn(1, 1, 2, 2),
+        noise=torch.randn(1, 2, 2, 2),
+        r=torch.tensor([0.2]),
+        t=torch.tensor([1.0]),
+        edge_loss_enabled=True,
+        edge_max_t=0.5,
+    )
+    assert terms.chroma_edge_loss.requires_grad
+    terms.chroma_edge_loss.backward()
+    torch.testing.assert_close(terms.chroma_edge_loss, torch.tensor(0.0))
+
+
+def test_enabled_chroma_edge_loss_requires_two_by_two_spatial_input():
+    with pytest.raises(ValueError, match="at least 2x2"):
+        meanflow_terms(
+            ToyModel(),
+            torch.randn(1, 2, 1, 2),
+            torch.randn(1, 1, 1, 2),
+            noise=torch.randn(1, 2, 1, 2),
+            r=torch.tensor([0.2]),
+            t=torch.tensor([0.8]),
+            edge_loss_enabled=True,
+        )
 
 
 def test_small_time_clean_conversion_and_endpoint_derivative():

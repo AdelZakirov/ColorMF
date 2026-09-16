@@ -26,6 +26,8 @@ class MeanFlowTerms:
     auxiliary_loss: Tensor
     perceptual_lpips_loss: Tensor
     perceptual_convnext_loss: Tensor
+    chroma_edge_loss: Tensor
+    chroma_edge_loss_per_example: Tensor
     total_loss: Tensor
     main_loss_per_example: Tensor
     auxiliary_loss_per_example: Tensor
@@ -106,6 +108,72 @@ def _adaptive_loss(residual: Tensor, norm_p: float, norm_eps: float):
 
 def _adaptive_values(values: Tensor, norm_p: float, norm_eps: float) -> Tensor:
     return values.float() / (values.float() + norm_eps).pow(norm_p).detach()
+
+
+def _validate_edge_loss_parameters(
+    edge_loss_weight: float,
+    edge_boundary_boost: float,
+    edge_max_t: float,
+) -> tuple[float, float, float]:
+    try:
+        weight = float(edge_loss_weight)
+        boundary_boost = float(edge_boundary_boost)
+        max_t = float(edge_max_t)
+    except (TypeError, ValueError) as error:
+        raise ValueError("edge loss parameters must be finite numbers") from error
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError("edge_loss_weight must be finite and non-negative")
+    if not math.isfinite(boundary_boost) or boundary_boost < 0.0:
+        raise ValueError("edge_boundary_boost must be finite and non-negative")
+    if not math.isfinite(max_t) or not 0.0 <= max_t <= 1.0:
+        raise ValueError("edge_max_t must be finite and within [0, 1]")
+    return weight, boundary_boost, max_t
+
+
+def _chroma_edge_loss(
+    predicted_clean_ab: Tensor,
+    target_ab: Tensor,
+    L: Tensor,
+    t: Tensor,
+    *,
+    enabled: bool,
+    boundary_boost: float,
+    max_t: float,
+) -> tuple[Tensor, Tensor]:
+    """Return raw per-example boundary-weighted chroma gradient L1 values."""
+    zero_per_example = torch.zeros(
+        predicted_clean_ab.shape[0],
+        device=predicted_clean_ab.device,
+        dtype=torch.float32,
+    )
+    if not enabled:
+        return zero_per_example.sum(), zero_per_example
+    if predicted_clean_ab.shape[-2] < 2 or predicted_clean_ab.shape[-1] < 2:
+        raise ValueError("edge loss requires spatial dimensions of at least 2x2")
+
+    active = t.flatten() <= max_t
+    active_indices = active.nonzero(as_tuple=True)[0]
+    if not active_indices.numel():
+        return predicted_clean_ab.float().sum() * 0.0, zero_per_example
+
+    predicted_ab = predicted_clean_ab[active_indices].float()
+    target_ab = target_ab[active_indices].float()
+    L_for_edges = ((L[active_indices].detach().float() + 1.0) * 0.5).clamp(0.0, 1.0)
+
+    pred_dx = predicted_ab[..., :, 1:] - predicted_ab[..., :, :-1]
+    pred_dy = predicted_ab[..., 1:, :] - predicted_ab[..., :-1, :]
+    gt_dx = target_ab[..., :, 1:] - target_ab[..., :, :-1]
+    gt_dy = target_ab[..., 1:, :] - target_ab[..., :-1, :]
+    edge_x = torch.abs(L_for_edges[..., :, 1:] - L_for_edges[..., :, :-1])
+    edge_y = torch.abs(L_for_edges[..., 1:, :] - L_for_edges[..., :-1, :])
+    weight_x = (1.0 + boundary_boost * edge_x.clamp(0.0, 1.0)).detach()
+    weight_y = (1.0 + boundary_boost * edge_y.clamp(0.0, 1.0)).detach()
+
+    loss_x_per_example = (weight_x * torch.abs(pred_dx - gt_dx)).flatten(1).mean(1)
+    loss_y_per_example = (weight_y * torch.abs(pred_dy - gt_dy)).flatten(1).mean(1)
+    active_values = 0.5 * (loss_x_per_example + loss_y_per_example)
+    per_example = zero_per_example.index_copy(0, active_indices, active_values)
+    return active_values.mean(), per_example
 
 
 def _auxiliary_direction(model: Callable, z: Tensor, L: Tensor, t: Tensor) -> Tensor:
@@ -193,12 +261,19 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
                    perceptual_fn: Optional[Callable[..., tuple[Tensor, Tensor]]] = None,
                    lpips_weight: float = 0.0, convnext_weight: float = 0.0,
                    perceptual_max_t: float = 0.8,
-                   split_diagonal_jvp: bool = False) -> MeanFlowTerms:
+                   split_diagonal_jvp: bool = False,
+                   edge_loss_enabled: bool = False,
+                   edge_loss_weight: float = 0.02,
+                   edge_boundary_boost: float = 4.0,
+                   edge_max_t: float = 1.0) -> MeanFlowTerms:
     """Evaluate official pMF training math for stochastic chroma state only."""
     if x.ndim != 4 or x.shape[1] != 2:
         raise ValueError("x must be stochastic ab state [B,2,H,W]")
     if L.shape != (x.shape[0], 1, *x.shape[-2:]):
         raise ValueError("L must be fixed [B,1,H,W]")
+    edge_loss_weight, edge_boundary_boost, edge_max_t = _validate_edge_loss_parameters(
+        edge_loss_weight, edge_boundary_boost, edge_max_t
+    )
     if not math.isfinite(float(noise_scale)) or noise_scale <= 0:
         raise ValueError("noise_scale must be a finite positive number")
     if noise is None:
@@ -245,6 +320,15 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
 
     reconstructed_ab = z - t.reshape(-1, 1, 1, 1) * u
     zeros = torch.zeros(x.shape[0], device=x.device, dtype=torch.float32)
+    chroma_edge_loss, chroma_edge_loss_per_example = _chroma_edge_loss(
+        reconstructed_ab,
+        x,
+        L,
+        t,
+        enabled=edge_loss_enabled,
+        boundary_boost=edge_boundary_boost,
+        max_t=edge_max_t,
+    )
     lpips_examples = convnext_examples = zeros
     perceptual_examples = zeros
     if perceptual_fn is not None and (lpips_weight or convnext_weight):
@@ -262,7 +346,12 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
                 lpips_weight * _adaptive_values(lpips_examples, adaptive_power, adaptive_epsilon)
                 + convnext_weight * _adaptive_values(convnext_examples, adaptive_power, adaptive_epsilon))
 
-    total_examples = loss_u_examples + auxiliary_weight * loss_v_examples + perceptual_examples
+    total_examples = (
+        loss_u_examples
+        + auxiliary_weight * loss_v_examples
+        + perceptual_examples
+        + edge_loss_weight * chroma_edge_loss_per_example
+    )
     return MeanFlowTerms(
         z=z, r=r, t=t, u_prediction=u, velocity_prediction=v,
         jvp_direction=v_direction, velocity_target=target, average_velocity_jvp=jvp,
@@ -270,6 +359,8 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
         main_loss=loss_u, auxiliary_loss=loss_v,
         perceptual_lpips_loss=lpips_examples.mean(),
         perceptual_convnext_loss=convnext_examples.mean(),
+        chroma_edge_loss=chroma_edge_loss,
+        chroma_edge_loss_per_example=chroma_edge_loss_per_example,
         total_loss=total_examples.mean(), main_loss_per_example=loss_u_examples,
         auxiliary_loss_per_example=loss_v_examples, total_loss_per_example=total_examples,
         main_velocity_mse_per_example=mse_u, auxiliary_velocity_mse_per_example=mse_v)
