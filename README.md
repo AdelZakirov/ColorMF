@@ -33,11 +33,24 @@ $$
 z_t = (1-t)\,ab + t\,\epsilon, \qquad \epsilon \sim \mathcal{N}(0,I).
 $$
 
-The transformer sees the noisy chroma and fixed luminance together:
+By default, the transformer sees the noisy chroma and fixed luminance together:
 
 ```text
 network input = concat(z_t, L)
 network output = two-channel chroma prediction
+```
+
+The model also supports dedicated luminance conditioning. Set
+`model.conditioning.mode` to `separate` to embed `z_ab` and `L` with independent
+bottleneck patch embedders, fuse their aligned spatial tokens residually, and
+optionally reinject the projected luminance tokens before each transformer
+block. `concat` is the default and remains compatible with existing checkpoints:
+
+```yaml
+model:
+  conditioning:
+    mode: concat  # concat | separate
+    reinject: true
 ```
 
 Training follows the pMF average-velocity objective and uses the auxiliary instantaneous-velocity branch for the JVP direction. At inference, sampling starts from Gaussian chroma noise at `t=1` and reaches a clean `ab` estimate in one forward pass. `L` is never noised, interpolated, or predicted.

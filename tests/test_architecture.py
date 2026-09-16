@@ -3,7 +3,14 @@ from pathlib import Path
 import torch
 import yaml
 
-from src.model import PixelMeanFlowB, RMSNorm, RoPEAttention, SwiGLUMlp
+from src.model import (
+    BottleneckPatchEmbedder,
+    PixelMeanFlowB,
+    RMSNorm,
+    RoPEAttention,
+    SwiGLUMlp,
+    TorchLinear,
+)
 
 
 def tiny_model():
@@ -96,3 +103,116 @@ def test_inference_does_not_execute_v_branch():
     handle.remove()
     assert calls == []
     assert model.last_sample_nfe == 1
+
+
+def test_concat_mode_preserves_legacy_state_dict_and_ignores_reinject():
+    kwargs = dict(resolution=16, patch_size=4, hidden_size=32, depth=4,
+                  num_heads=4, aux_head_depth=2, pca_channels=8)
+    torch.manual_seed(123)
+    legacy = PixelMeanFlowB(**kwargs)
+    torch.manual_seed(123)
+    explicit = PixelMeanFlowB(**kwargs, conditioning={"mode": "concat", "reinject": False})
+    assert isinstance(explicit.x_embedder, BottleneckPatchEmbedder)
+    assert not any("condition" in key or "state_embedder" in key
+                   for key in explicit.state_dict())
+    assert list(legacy.state_dict()) == list(explicit.state_dict())
+    for key, value in legacy.state_dict().items():
+        torch.testing.assert_close(value, explicit.state_dict()[key])
+    z = torch.randn(2, 2, 16, 16)
+    L = torch.randn(2, 1, 16, 16)
+    r, t = torch.tensor([0.1, 0.2]), torch.tensor([0.7, 0.8])
+    torch.testing.assert_close(legacy(z, L, r, t)[0], explicit(z, L, r, t)[0])
+
+
+def test_separate_conditioning_has_aligned_embedders_and_zero_gates():
+    model = PixelMeanFlowB(
+        resolution=16, patch_size=4, hidden_size=32, depth=4, num_heads=4,
+        aux_head_depth=2, pca_channels=8,
+        conditioning={"mode": "separate", "reinject": True},
+    )
+    assert not hasattr(model, "x_embedder")
+    assert isinstance(model.state_embedder, BottleneckPatchEmbedder)
+    assert isinstance(model.condition_embedder, BottleneckPatchEmbedder)
+    assert model.state_embedder is not model.condition_embedder
+    assert model.state_embedder.proj1.in_channels == 2
+    assert model.condition_embedder.proj1.in_channels == 1
+    assert model.state_embedder.patch_size == model.condition_embedder.patch_size
+    assert model.state_embedder.grid_size == model.condition_embedder.grid_size
+    assert model.num_spatial_tokens == model.state_embedder.num_patches == 16
+    assert isinstance(model.condition_norm, RMSNorm)
+    assert isinstance(model.condition_proj, TorchLinear)
+    assert model.condition_proj._flax_linear.bias is None
+    for gates, blocks in (
+        (model.shared_condition_gates, model.shared_blocks),
+        (model.u_condition_gates, model.u_blocks),
+        (model.v_condition_gates, model.v_blocks),
+    ):
+        assert len(gates) == len(blocks)
+        assert all(gate.shape == (model.hidden_size,) for gate in gates)
+        assert all(torch.count_nonzero(gate) == 0 for gate in gates)
+
+
+def test_separate_initial_fusion_and_condition_sequence_are_spatially_aligned():
+    model = PixelMeanFlowB(
+        resolution=16, patch_size=4, hidden_size=32, depth=4, num_heads=4,
+        aux_head_depth=2, pca_channels=8,
+        conditioning={"mode": "separate", "reinject": True},
+    )
+    z = torch.randn(2, 2, 16, 16)
+    L = torch.randn(2, 1, 16, 16)
+    h = torch.tensor([0.2, 0.7])
+    sequence, condition = model._sequence(z, L, h)
+    state = model.state_embedder(z)
+    projected = model.condition_proj(model.condition_norm(model.condition_embedder(L)))
+    expected = torch.cat([model.time_tokens + model.h_embedder(h)[:, None],
+                          state + projected], dim=1) + model.pos_embed
+    torch.testing.assert_close(sequence, expected)
+    assert condition.shape == sequence.shape
+    assert torch.count_nonzero(condition[:, :model.prefix_tokens]) == 0
+    torch.testing.assert_close(condition[:, model.prefix_tokens:], projected)
+
+
+def test_separate_reinjection_is_reused_by_auxiliary_direction_and_keeps_l_gradients():
+    model = PixelMeanFlowB(
+        resolution=16, patch_size=4, hidden_size=32, depth=4, num_heads=4,
+        aux_head_depth=2, pca_channels=8,
+        conditioning={"mode": "separate", "reinject": True},
+    ).eval()
+    with torch.no_grad():
+        for block in [*model.shared_blocks, *model.u_blocks, *model.v_blocks]:
+            block.attn_scale.normal_(std=0.02)
+            block.mlp_scale.normal_(std=0.02)
+        for gates in [model.shared_condition_gates, model.u_condition_gates,
+                      model.v_condition_gates]:
+            for gate in gates:
+                gate.normal_(std=0.02)
+        model.v_final_layer.linear._flax_linear.weight.normal_(std=0.01)
+        model.v_final_layer.linear._flax_linear.bias.normal_(std=0.01)
+        model.u_final_layer.linear._flax_linear.weight.normal_(std=0.01)
+    z = torch.randn(2, 2, 16, 16)
+    L = torch.randn(2, 1, 16, 16, requires_grad=True)
+    t = torch.tensor([0.2, 0.7])
+    with torch.no_grad():
+        expected = model(z, L, t, t)[1]
+        actual = model.auxiliary_direction(z, L, t)
+    torch.testing.assert_close(actual, expected)
+    u, _ = model(z, L, t, t, return_velocity=False)
+    u.square().mean().backward()
+    assert torch.count_nonzero(L.grad) > 0
+    assert torch.count_nonzero(model.condition_proj._flax_linear.weight.grad) > 0
+
+
+def test_separate_without_reinjection_has_no_gate_parameters_and_reports_all_parameters():
+    model = PixelMeanFlowB(
+        resolution=16, patch_size=4, hidden_size=32, depth=4, num_heads=4,
+        aux_head_depth=2, pca_channels=8,
+        conditioning={"mode": "separate", "reinject": False},
+    )
+    assert model.shared_condition_gates is None
+    assert model.u_condition_gates is None
+    assert model.v_condition_gates is None
+    assert not any("condition_gates" in key for key in model.state_dict())
+    report = model.parameter_report()
+    assert report["total_training_parameters"] == (
+        report["shared_parameters"] + report["u_head_parameters"]
+        + report["v_head_parameters"])

@@ -14,6 +14,7 @@ model:
   pca_channels: 128
   num_time_tokens: 4
   weight_init_constant: 0.32
+  conditioning: {mode: concat, reinject: true}
 
 data:
   train_manifest: data/ffhq.txt
