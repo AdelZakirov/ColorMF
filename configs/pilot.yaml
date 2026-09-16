@@ -9,6 +9,7 @@ model:
   mlp_ratio: 4.0
   aux_head_depth: 8
   pca_channels: 128
+  conditioning: {mode: concat, reinject: true}
 
 data:
   # Prefer manifests for very large datasets. Each line is either:

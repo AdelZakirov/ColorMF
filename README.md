@@ -14,6 +14,19 @@ network outputs = u_ab, v_ab
 as a JVP primal/tangent. There are no class labels, CFG, semantic encoders,
 cross-attention, or ControlNet-style paths.
 
+The model also supports dedicated luminance conditioning. Set
+`model.conditioning.mode` to `separate` to embed `z_ab` and `L` with independent
+bottleneck patch embedders, fuse their aligned spatial tokens residually, and
+optionally reinject the projected luminance tokens before each transformer
+block. `concat` is the default and remains compatible with existing checkpoints:
+
+```yaml
+model:
+  conditioning:
+    mode: concat  # concat | separate
+    reinject: true
+```
+
 ## Pinned references
 
 - JAX training/objective: `Lyy-iiis/pMF@75f6073042c21f7104686261a0c4784db4ede9d1`

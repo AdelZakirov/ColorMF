@@ -1,8 +1,9 @@
 """Official pMF-B architecture adapted to conditional LAB colorization.
 
 The transformer follows Lyy-iiis/pMF's PyTorch inference branch at commit
-990e81a84249dbd68a128accef67eb95621d10b1. The sole model adaptation is a
-three-channel spatial input ``[z_ab, L]`` and two-channel ``ab`` heads.
+990e81a84249dbd68a128accef67eb95621d10b1. The default concat mode uses a
+three-channel spatial input ``[z_ab, L]`` and two-channel ``ab`` heads;
+separate mode gives state and luminance their own spatial representations.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import math
 from functools import partial
-from typing import Optional, Sequence, Tuple, Union
+from typing import Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -210,7 +211,11 @@ class FinalLayer(nn.Module):
 
 
 class PixelMeanFlowB(nn.Module):
-    """pMF-B adapted from RGB generation to conditional ``p(ab | L)``."""
+    """pMF-B adapted from RGB generation to conditional ``p(ab | L)``.
+
+    ``conditioning.mode='concat'`` is the legacy architecture; ``'separate'``
+    uses independent state and luminance token representations.
+    """
 
     def __init__(self, *, resolution: Union[int, Tuple[int, int]] = 256,
                  patch_size: int = 16, in_channels: int = 3, out_channels: int = 2,
@@ -219,7 +224,8 @@ class PixelMeanFlowB(nn.Module):
                  aux_head_depth: int = 8, pca_channels: int = 128,
                  num_time_tokens: int = 4, token_init_constant: float = 1.0,
                  embedding_init_constant: float = 1.0,
-                 weight_init_constant: float = 0.32):
+                 weight_init_constant: float = 0.32,
+                 conditioning: Optional[Mapping[str, object]] = None):
         super().__init__()
         if heads is not None:
             num_heads = heads
@@ -233,6 +239,14 @@ class PixelMeanFlowB(nn.Module):
             raise ValueError("conditional pMF expects [z_ab,L] input and ab output")
         if not 0 < aux_head_depth < depth:
             raise ValueError("aux_head_depth must leave at least one shared block")
+        if conditioning is None:
+            conditioning = {}
+        if not isinstance(conditioning, Mapping):
+            raise TypeError("conditioning must be a mapping with mode and reinject")
+        conditioning_mode = conditioning.get("mode", "concat")
+        if conditioning_mode not in {"concat", "separate"}:
+            raise ValueError("conditioning.mode must be 'concat' or 'separate'")
+        conditioning_reinject = bool(conditioning.get("reinject", True))
         self.resolution = (resolution, resolution)
         self.input_size = resolution
         self.patch_size = patch_size
@@ -244,8 +258,35 @@ class PixelMeanFlowB(nn.Module):
         self.num_heads = num_heads
         self.aux_head_depth = aux_head_depth
         self.num_time_tokens = num_time_tokens
-        self.x_embedder = BottleneckPatchEmbedder(
-            resolution, patch_size, pca_channels, in_channels, hidden_size, bias=True)
+        self.conditioning_mode = conditioning_mode
+        self.conditioning_reinject = conditioning_reinject
+        # Keep this alias convenient for callers that use the config spelling.
+        self.reinject = conditioning_reinject
+        if conditioning_mode == "concat":
+            # This is intentionally the legacy construction path. In particular,
+            # keep the module name, type, arguments, and initialization unchanged
+            # so old concat checkpoints retain their exact state-dict keys.
+            self.x_embedder = BottleneckPatchEmbedder(
+                resolution, patch_size, pca_channels, in_channels, hidden_size, bias=True)
+            self._spatial_num_patches = self.x_embedder.num_patches
+            self._spatial_grid_size = self.x_embedder.grid_size
+        else:
+            self.state_embedder = BottleneckPatchEmbedder(
+                resolution, patch_size, pca_channels, self.state_channels, hidden_size,
+                bias=True)
+            self.condition_embedder = BottleneckPatchEmbedder(
+                resolution, patch_size, pca_channels, 1, hidden_size, bias=True)
+            if (self.state_embedder.patch_size != self.condition_embedder.patch_size or
+                    self.state_embedder.grid_size != self.condition_embedder.grid_size or
+                    self.state_embedder.num_patches != self.condition_embedder.num_patches):
+                raise ValueError(
+                    "state and condition embedders must use the same patch and token grid")
+            self._spatial_num_patches = self.state_embedder.num_patches
+            self._spatial_grid_size = self.state_embedder.grid_size
+            self.condition_norm = RMSNorm(hidden_size)
+            self.condition_proj = TorchLinear(
+                hidden_size, hidden_size, bias=False,
+                weight_init="scaled_variance", init_constant=embedding_init_constant)
         self.h_embedder = TimestepEmbedder(
             hidden_size, weight_init="scaled_variance", init_constant=embedding_init_constant)
         token_initializer = partial(nn.init.normal_,
@@ -254,9 +295,9 @@ class PixelMeanFlowB(nn.Module):
             torch.empty(1, num_time_tokens, hidden_size)))
         self.prefix_tokens = num_time_tokens
         self.pos_embed = nn.Parameter(nn.init.normal_(torch.empty(
-            1, self.x_embedder.num_patches + num_time_tokens, hidden_size), std=0.02))
+            1, self._spatial_num_patches + num_time_tokens, hidden_size), std=0.02))
         self.register_buffer("rope_freqs", precompute_rope_freqs(
-            hidden_size // num_heads, self.x_embedder.num_patches), persistent=False)
+            hidden_size // num_heads, self._spatial_num_patches), persistent=False)
         block_kwargs = dict(hidden_size=hidden_size, num_heads=num_heads,
                             mlp_ratio=mlp_ratio, weight_init="scaled_variance",
                             weight_init_constant=weight_init_constant)
@@ -266,6 +307,21 @@ class PixelMeanFlowB(nn.Module):
                                        for _ in range(aux_head_depth)])
         self.v_blocks = nn.ModuleList([TransformerBlock(**block_kwargs)
                                        for _ in range(aux_head_depth)])
+        if conditioning_mode == "separate" and conditioning_reinject:
+            self.shared_condition_gates = nn.ParameterList([
+                nn.Parameter(torch.zeros(hidden_size)) for _ in self.shared_blocks
+            ])
+            self.u_condition_gates = nn.ParameterList([
+                nn.Parameter(torch.zeros(hidden_size)) for _ in self.u_blocks
+            ])
+            self.v_condition_gates = nn.ParameterList([
+                nn.Parameter(torch.zeros(hidden_size)) for _ in self.v_blocks
+            ])
+        else:
+            # No unused gate parameters in concat mode or when reinjection is off.
+            self.shared_condition_gates = None
+            self.u_condition_gates = None
+            self.v_condition_gates = None
         self.u_final_layer = FinalLayer(hidden_size, patch_size, out_channels)
         self.v_final_layer = FinalLayer(hidden_size, patch_size, out_channels)
         self.main_model_evaluations = 0
@@ -273,7 +329,7 @@ class PixelMeanFlowB(nn.Module):
 
     @property
     def num_spatial_tokens(self) -> int:
-        return self.x_embedder.num_patches
+        return self._spatial_num_patches
 
     def _unpatchify(self, tokens: Tensor) -> Tensor:
         side = math.isqrt(tokens.shape[1])
@@ -291,43 +347,73 @@ class PixelMeanFlowB(nn.Module):
                                     value.new_tensor(1.0)).reshape(-1, 1, 1, 1)
         return (z.float() - clean.float()) / denominator
 
-    def _sequence(self, z: Tensor, L: Tensor, h: Tensor) -> Tensor:
+    def _sequence(self, z: Tensor, L: Tensor, h: Tensor) -> tuple[Tensor, Optional[Tensor]]:
         if z.ndim != 4 or z.shape[1] != 2:
             raise ValueError("z must be [B,2,H,W]; L is not stochastic state")
         if L.shape != (z.shape[0], 1, *z.shape[-2:]):
             raise ValueError("L must be [B,1,H,W] and match z")
         if z.shape[-2:] != self.resolution:
             raise ValueError(f"expected resolution {self.resolution}")
-        spatial = self.x_embedder(torch.cat([z, L], dim=1))
+        if self.conditioning_mode == "concat":
+            spatial = self.x_embedder(torch.cat([z, L], dim=1))
+            condition_sequence = None
+        else:
+            state_tokens = self.state_embedder(z)
+            condition_tokens = self.condition_embedder(L)
+            projected_condition = self.condition_proj(self.condition_norm(condition_tokens))
+            spatial = state_tokens + projected_condition
+            condition_sequence = torch.cat([
+                projected_condition.new_zeros(
+                    projected_condition.shape[0], self.prefix_tokens, self.hidden_size),
+                projected_condition,
+            ], dim=1)
         time = self.time_tokens + self.h_embedder(h)[:, None]
-        return torch.cat([time, spatial], dim=1) + self.pos_embed
+        sequence = torch.cat([time, spatial], dim=1) + self.pos_embed
+        return sequence, condition_sequence
+
+    def run_blocks(
+        self,
+        sequence: Tensor,
+        condition_sequence: Optional[Tensor],
+        blocks: nn.ModuleList,
+        gates: Optional[nn.ParameterList],
+    ) -> Tensor:
+        """Run a stack with the same optional spatial conditioning semantics."""
+        if condition_sequence is not None and gates is not None:
+            if len(gates) != len(blocks):
+                raise ValueError("conditioning gate count must match block count")
+            for block, gate in zip(blocks, gates):
+                sequence = sequence + gate * condition_sequence
+                sequence = block(sequence, self.rope_freqs)
+            return sequence
+        for block in blocks:
+            sequence = block(sequence, self.rope_freqs)
+        return sequence
 
     def forward(self, z: Tensor, L: Tensor, r: Tensor, t: Tensor, *,
                 return_velocity: bool = True) -> tuple[Tensor, Optional[Tensor]]:
-        sequence = self._sequence(z, L, t - r)
-        for block in self.shared_blocks:
-            sequence = block(sequence, self.rope_freqs)
-        u_sequence = sequence
-        for block in self.u_blocks:
-            u_sequence = block(u_sequence, self.rope_freqs)
+        sequence, condition_sequence = self._sequence(z, L, t - r)
+        sequence = self.run_blocks(
+            sequence, condition_sequence, self.shared_blocks, self.shared_condition_gates)
+        u_sequence = self.run_blocks(
+            sequence, condition_sequence, self.u_blocks, self.u_condition_gates)
         u_clean = self._unpatchify(self.u_final_layer(
             u_sequence[:, self.prefix_tokens:]))
         u = self._velocity(z, u_clean, t)
         if not return_velocity:
             return u, None
-        v_sequence = sequence
-        for block in self.v_blocks:
-            v_sequence = block(v_sequence, self.rope_freqs)
+        v_sequence = self.run_blocks(
+            sequence, condition_sequence, self.v_blocks, self.v_condition_gates)
         v_clean = self._unpatchify(self.v_final_layer(
             v_sequence[:, self.prefix_tokens:]))
         return u, self._velocity(z, v_clean, t)
 
     def auxiliary_direction(self, z: Tensor, L: Tensor, t: Tensor) -> Tensor:
-        sequence = self._sequence(z, L, torch.zeros_like(t))
-        for block in self.shared_blocks:
-            sequence = block(sequence, self.rope_freqs)
-        for block in self.v_blocks:
-            sequence = block(sequence, self.rope_freqs)
+        sequence, condition_sequence = self._sequence(z, L, torch.zeros_like(t))
+        sequence = self.run_blocks(
+            sequence, condition_sequence, self.shared_blocks, self.shared_condition_gates)
+        sequence = self.run_blocks(
+            sequence, condition_sequence, self.v_blocks, self.v_condition_gates)
         clean = self._unpatchify(self.v_final_layer(
             sequence[:, self.prefix_tokens:]))
         return self._velocity(z, clean, t)
@@ -387,10 +473,21 @@ class PixelMeanFlowB(nn.Module):
                    for parameter in module.parameters())
 
     def parameter_report(self) -> dict[str, int]:
-        shared = self._count([self.x_embedder, self.h_embedder, self.shared_blocks])
+        embedding_modules = (
+            [self.x_embedder] if self.conditioning_mode == "concat" else
+            [self.state_embedder, self.condition_embedder,
+             self.condition_norm, self.condition_proj]
+        )
+        shared = self._count([*embedding_modules, self.h_embedder, self.shared_blocks])
         shared += self.time_tokens.numel() + self.pos_embed.numel()
+        if self.shared_condition_gates is not None:
+            shared += self._count([self.shared_condition_gates])
         u = self._count([self.u_blocks, self.u_final_layer])
+        if self.u_condition_gates is not None:
+            u += self._count([self.u_condition_gates])
         v = self._count([self.v_blocks, self.v_final_layer])
+        if self.v_condition_gates is not None:
+            v += self._count([self.v_condition_gates])
         return {"total_training_parameters": sum(p.numel() for p in self.parameters()),
                 "shared_parameters": shared, "u_head_parameters": u,
                 "v_head_parameters": v, "inference_required_parameters": shared + u}
