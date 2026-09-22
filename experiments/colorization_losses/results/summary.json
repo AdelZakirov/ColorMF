@@ -1,0 +1,105 @@
+{
+  "batch_size": 4,
+  "config": {
+    "convnext_input_range": "processor_mean_std",
+    "convnext_model": "facebook/convnextv2-base-22k-224",
+    "dino_layers": [
+      3,
+      6,
+      9,
+      12
+    ],
+    "dino_model": "facebook/dinov3-vits16-pretrain-lvd1689m",
+    "feature_size": 224,
+    "huber_beta": 5.0
+  },
+  "convnext_perceptual": "equal-weight spatial MSE over all four ConvNeXtV2 stages; processor mean/std; full-image resize (not exact pMF)",
+  "dataset_dir": "experiments/colorization_losses/data",
+  "device": "cuda",
+  "dinov3_perceptual": "mean patch cosine distance at layers 3,6,9,12 excluding CLS/registers; processor normalization",
+  "error_types": [
+    "wrong_hue",
+    "low_saturation",
+    "color_bleeding",
+    "subtle_color_error",
+    "semantically_wrong_color",
+    "plausible_alternative_colorization"
+  ],
+  "generation_manifest_sha256": "6b306628775abc3a66f290431772c8ebf69face2a3fe1b28db0aad99d7476b6e",
+  "generation_protocol": {
+    "condition": "PIL_grayscale_RGB",
+    "model": "Qwen/Qwen-Image-2.1",
+    "projection": "source_L_generated_ab_gamut_compression",
+    "prompts": {
+      "plausible_alternative_colorization": "Colorize this grayscale image. Preserve the exact scene structure, composition, object count, object positions, shapes, contours, boundaries, textures, fine details, shadows, highlights, and brightness structure. Do not redraw, add, remove, move, distort, or hallucinate any content. Keep the original grayscale luminance and change only the chromatic colors. Create a realistic, coherent, natural colorization with plausible colors for every object and material.",
+      "semantically_wrong_color": "Colorize this grayscale image. Preserve the exact scene structure, composition, object count, object positions, shapes, contours, boundaries, textures, fine details, shadows, highlights, and brightness structure. Do not redraw, add, remove, move, distort, or hallucinate any content. Keep the original grayscale luminance and change only the chromatic colors. Create a coherent colorization with clearly semantically implausible colors for recognizable objects and materials: for example blue or violet skin, purple vegetation, or green skies. Retain natural shading and local texture; change object colors rather than applying a global color filter."
+    },
+    "resolution": 256,
+    "seed": 42,
+    "source_chroma_magnitude_reused": false,
+    "steps": 40,
+    "true_cfg_scale": 1.0,
+    "version": 2
+  },
+  "geometry": "paired full-image bicubic antialiased resize to 224; no random crop",
+  "gradient_ab": "mean L1 difference of horizontal/vertical finite differences on physical a*,b*",
+  "gradient_space": "physical_ab_fixed_L",
+  "huber_ab": "SmoothL1 on physical CIELAB a*,b*, beta=5",
+  "loss_names": [
+    "huber_ab",
+    "gradient_ab",
+    "lpips_vgg",
+    "convnext_perceptual",
+    "dinov3_perceptual"
+  ],
+  "lpips_vgg": "LPIPS VGG16 on RGB resized to 224 and scaled to [-1,1]",
+  "model_revisions": {
+    "convnext": "758ff0922dc09136abb55774e7f8b1e1bd0dc344",
+    "dino": "114c1379950215c8b35dfcd4e90a5c251dde0d32"
+  },
+  "normalization": {
+    "convnext_mean": [
+      0.48500001430511475,
+      0.4560000002384186,
+      0.4059999883174896
+    ],
+    "convnext_std": [
+      0.2290000021457672,
+      0.2240000069141388,
+      0.22499999403953552
+    ],
+    "dino_mean": [
+      0.48500001430511475,
+      0.4560000002384186,
+      0.4059999883174896
+    ],
+    "dino_std": [
+      0.2290000021457672,
+      0.2240000069141388,
+      0.22499999403953552
+    ]
+  },
+  "normalized_ab_gradient_scale": 127.5,
+  "output_dir": "experiments/colorization_losses/results",
+  "package_versions": {
+    "kornia": "0.8.3",
+    "lpips": "0.1.4",
+    "torch": "2.14.0",
+    "transformers": "5.17.0"
+  },
+  "pair_count": 3696,
+  "protocol_version": 2,
+  "sample_count": 154,
+  "semantic_labels": "unverified generator candidates; exploratory, not human semantic ground truth",
+  "semantic_matching": "within source, equal mean ab distance after gamut projection",
+  "severity_levels": [
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "source_sha256": {
+    "experiments/colorization_losses/evaluate.py": "280684e8b398a504dcc4969262f8a1695577cd54d7d3c02d06d65a5daa73bfd2",
+    "experiments/colorization_losses/losses.py": "2c231edbf7e91de696048b10ff3e713c06589615eb27c5087f4f0b0909a076cd"
+  }
+}

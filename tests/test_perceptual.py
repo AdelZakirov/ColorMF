@@ -18,9 +18,10 @@ class IdentityFeatures(torch.nn.Module):
         self.scale = torch.nn.Parameter(torch.ones(()))
         self.last_input = None
 
-    def forward(self, pixel_values):
+    def forward(self, pixel_values, output_hidden_states=False):
         self.last_input = pixel_values.detach().clone()
-        return self.scale * pixel_values.mean((2, 3))
+        from types import SimpleNamespace
+        return SimpleNamespace(hidden_states=(pixel_values, self.scale * pixel_values))
 
 
 def test_rgb_path_is_differentiable_preserves_l_and_does_not_clamp_ab():
@@ -52,13 +53,13 @@ def test_loss_networks_are_frozen():
                for network in (lpips, convnext) for parameter in network.parameters())
 
 
-def test_convnext_receives_official_minus_one_to_one_range_without_mean_std():
+def test_convnext_receives_checkpoint_mean_std():
     convnext = IdentityFeatures()
     losses = PerceptualLosses(use_lpips=False, use_convnext=True,
                               convnext_network=convnext)
     L = torch.zeros(1, 1, 32, 32)
     ab = torch.zeros(1, 2, 32, 32)
-    expected = normalized_lab_to_rgb(L, ab) * 2 - 1
+    expected = (normalized_lab_to_rgb(L, ab) - torch.tensor([.485,.456,.406]).view(1,3,1,1)) / torch.tensor([.229,.224,.225]).view(1,3,1,1)
     losses(ab, ab, L)
     assert convnext.last_input is not None
     # Constant images are invariant under the paired random resized crop.

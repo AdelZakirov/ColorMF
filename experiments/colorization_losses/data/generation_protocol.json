@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "seed": 42,
+  "model": "Qwen/Qwen-Image-2.1",
+  "steps": 40,
+  "resolution": 256,
+  "true_cfg_scale": 1.0,
+  "prompts": {
+    "plausible_alternative_colorization": "Colorize this grayscale image. Preserve the exact scene structure, composition, object count, object positions, shapes, contours, boundaries, textures, fine details, shadows, highlights, and brightness structure. Do not redraw, add, remove, move, distort, or hallucinate any content. Keep the original grayscale luminance and change only the chromatic colors. Create a realistic, coherent, natural colorization with plausible colors for every object and material.",
+    "semantically_wrong_color": "Colorize this grayscale image. Preserve the exact scene structure, composition, object count, object positions, shapes, contours, boundaries, textures, fine details, shadows, highlights, and brightness structure. Do not redraw, add, remove, move, distort, or hallucinate any content. Keep the original grayscale luminance and change only the chromatic colors. Create a coherent colorization with clearly semantically implausible colors for recognizable objects and materials: for example blue or violet skin, purple vegetation, or green skies. Retain natural shading and local texture; change object colors rather than applying a global color filter."
+  },
+  "condition": "PIL_grayscale_RGB",
+  "projection": "source_L_generated_ab_gamut_compression",
+  "source_chroma_magnitude_reused": false,
+  "batch_per_source": true
+}

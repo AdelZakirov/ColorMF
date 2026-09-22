@@ -1,0 +1,96 @@
+{
+  "partial": false,
+  "source_count": 154,
+  "variant_count": 1078,
+  "qwen_count": 308,
+  "seed": 42,
+  "max_projected_mean_abs_delta_L": 0.1092919409275055,
+  "mean_raw_abs_delta_L": 3.9134260187675425,
+  "near_grayscale_candidates": [
+    {
+      "sample_id": "im106",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im118",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im121",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im122",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im132",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im178",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im19",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im24",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im29",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im30",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im34",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im36",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im37",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im40",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im42",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im45",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im56",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im60",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im62",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im70",
+      "variant": "plausible_alternative_colorization"
+    },
+    {
+      "sample_id": "im78",
+      "variant": "plausible_alternative_colorization"
+    }
+  ],
+  "human_semantic_validation": "pending; file and numeric checks do not establish plausibility"
+}

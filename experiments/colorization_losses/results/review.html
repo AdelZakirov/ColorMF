@@ -1,0 +1,72 @@
+<!doctype html><meta charset="utf-8"><title>Исправленный loss experiment</title><style>body{max-width:1000px;margin:40px auto;padding:0 20px;font:16px/1.5 system-ui}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:8px;text-align:left}th{background:#eee}</style><h1>Исправленный эксперимент по colorization losses</h1>
+<p>**Рекомендация «ConvNeXt first, DINO second» отозвана.** Huber + Gradient остаётся разумным baseline, но оптимальность комбинации не установлена.</p>
+<p>Полный пересчёт: 154 исходника, 3696 оценок, 4 severity, устройство cuda. Все значения и нормы градиентов конечны. Максимальное расхождение severity в semantic/plausible паре: 7.6e-06 Lab units.</p>
+<h2>Sensitivity по типам ошибок</h2>
+<p>Доля среднего loss данного типа в сумме средних этого же loss по шести типам. Столбцы нормированы независимо: они сравнивают профиль одного loss, но не абсолютную силу разных loss.</p>
+<table><tr><th>Тип ошибки</th><th>Huber(ab)</th><th>Gradient(ab)</th><th>LPIPS/VGG</th><th>ConvNeXt</th><th>DINOv3</th></tr>
+<tr><td>wrong_hue</td><td>26.3%</td><td>21.6%</td><td>31.7%</td><td>21.7%</td><td>25.1%</td></tr>
+<tr><td>low_saturation</td><td>20.3%</td><td>13.9%</td><td>13.2%</td><td>12.6%</td><td>10.1%</td></tr>
+<tr><td>color_bleeding</td><td>1.8%</td><td>10.5%</td><td>3.7%</td><td>10.3%</td><td>5.9%</td></tr>
+<tr><td>subtle_color_error</td><td>2.1%</td><td>4.1%</td><td>2.4%</td><td>3.8%</td><td>2.0%</td></tr>
+<tr><td>semantically_wrong_color</td><td>24.8%</td><td>20.4%</td><td>24.0%</td><td>21.1%</td><td>24.7%</td></tr>
+<tr><td>plausible_alternative_colorization</td><td>24.6%</td><td>29.5%</td><td>25.0%</td><td>30.5%</td><td>32.2%</td></tr>
+</table>
+<p>Для wrong_hue наибольшая относительная доля у LPIPS (31.7%), затем Huber (26.3%) и DINOv3 (25.1%). Для color_bleeding наиболее выраженный профиль дают Gradient(ab) (10.5%) и spatial ConvNeXt (10.3%); Huber почти не выделяет bleeding (1.8%). Это относительная sensitivity на данном наборе, а не меж-loss рейтинг.</p>
+<h2>Рост loss с severity</h2>
+<p>Средний within-image Spearman по четырём уровням; в скобках доля строго монотонных кривых. Эта проверка не смешивает разные изображения.</p>
+<table><tr><th>Тип ошибки</th><th>Huber(ab)</th><th>Gradient(ab)</th><th>LPIPS/VGG</th><th>ConvNeXt</th><th>DINOv3</th></tr>
+<tr><td>wrong_hue</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>0.964 (86%)</td><td>1.000 (100%)</td></tr>
+<tr><td>low_saturation</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>0.918 (81%)</td><td>1.000 (100%)</td></tr>
+<tr><td>color_bleeding</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>0.990 (97%)</td><td>1.000 (100%)</td></tr>
+<tr><td>subtle_color_error</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>0.992 (98%)</td><td>1.000 (100%)</td></tr>
+<tr><td>semantically_wrong_color</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>0.958 (92%)</td><td>1.000 (100%)</td></tr>
+<tr><td>plausible_alternative_colorization</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>1.000 (100%)</td><td>0.916 (76%)</td><td>1.000 (100%)</td></tr>
+</table>
+<p>Huber наиболее стабильно растёт с фактическим ab-отклонением. LPIPS и DINOv3 тоже в основном монотонны. ConvNeXt менее стабилен; Gradient(ab) хорошо отслеживает величину bleeding, но норма его градиента почти постоянна из-за L1.</p>
+<h2>Что показывают парные результаты</h2>
+<p>Доля пар, в которых loss для semantic wrong **выше**, чем для plausible alternative, при одинаковом среднем расстоянии ab внутри одного исходника. 95% интервалы: bootstrap по исходникам, 2000 повторов, seed=0. Четыре severity одного исходника не считаются независимыми наблюдениями.</p>
+<table><tr><th>Loss</th><th>Semantic &gt; plausible</th><th>95% CI</th></tr>
+<tr><td>huber_ab</td><td>61.0%</td><td>54.5%–67.2%</td></tr>
+<tr><td>gradient_ab</td><td>11.7%</td><td>7.1%–16.9%</td></tr>
+<tr><td>lpips_vgg</td><td>40.9%</td><td>34.6%–47.6%</td></tr>
+<tr><td>convnext_perceptual</td><td>23.7%</td><td>18.8%–28.7%</td></tr>
+<tr><td>dinov3_perceptual</td><td>31.0%</td><td>25.5%–36.4%</td></tr>
+</table>
+<p>Таблица описывает парное предпочтение каждого loss на данном наборе кандидатов. Это не доказательство семантической инверсии: совпадение среднего ab не контролирует площадь изменений, текстуру, локальные границы и достоверность меток Qwen. После ослабления corruption её цвет может стать правдоподобным. Нужна человеческая проверка именно matched-примеров и объектные маски.</p>
+<p>В старом CSV средняя severity была 35.72 против 13.43 (2.66×), а pooled ConvNeXt давал semantic больший loss в 89.29% пар. Сравнение старого и нового процентов не является отдельной абляцией matching: одновременно изменились признаки, preprocessing и gamut handling.</p>
+<h2>Масштаб градиента</h2>
+<p>Median gradient RMS по physical ab, усреднённый по типам ошибок. Абсолютный масштаб зависит от формулы и reduction; перед смешиванием нужны коэффициенты или gradient balancing.</p>
+<table><tr><th>Loss</th><th>Median gradient RMS</th></tr>
+<tr><td>huber_ab</td><td>4.304e-06</td></tr>
+<tr><td>gradient_ab</td><td>8.134e-06</td></tr>
+<tr><td>lpips_vgg</td><td>9.026e-07</td></tr>
+<tr><td>convnext_perceptual</td><td>1.534e-01</td></tr>
+<tr><td>dinov3_perceptual</td><td>3.793e-07</td></tr>
+</table>
+<h2>Матрица gradient cosine similarity</h2>
+<p>Средний cosine по 3696 изображениям; диагональ равна 1 по определению.</p>
+<table><tr><th>Loss</th><th>Huber</th><th>Gradient</th><th>LPIPS</th><th>ConvNeXt</th><th>DINOv3</th></tr>
+<tr><td>Huber</td><td>1.0000</td><td>0.1171</td><td>0.1190</td><td>0.0014</td><td>0.0500</td></tr>
+<tr><td>Gradient</td><td>0.1171</td><td>1.0000</td><td>0.0245</td><td>0.0029</td><td>0.0141</td></tr>
+<tr><td>LPIPS</td><td>0.1190</td><td>0.0245</td><td>1.0000</td><td>0.0031</td><td>0.0562</td></tr>
+<tr><td>ConvNeXt</td><td>0.0014</td><td>0.0029</td><td>0.0031</td><td>1.0000</td><td>0.0043</td></tr>
+<tr><td>DINOv3</td><td>0.0500</td><td>0.0141</td><td>0.0562</td><td>0.0043</td><td>1.0000</td></tr>
+</table>
+<p>Cosine остался низким и в доступном модели пространстве ab. Значит RGB-параметризация не была единственным объяснением. Низкий cosine показывает разные направления, но не полезность их комбинации. Для нормализованного ab нормы умножаются на 127.5; cosine не меняется. Это градиенты изображений, а не параметров модели. Самые похожие пары — Huber–LPIPS (0.119) и Huber–Gradient (0.117), но даже это слабое совпадение. ConvNeXt почти ортогонален всем остальным (0.001–0.004): это новый сигнал по направлению, но его полезность из одной ортогональности не следует.</p>
+<h2>Вывод для обучения pMF</h2>
+<p>1. **Базовый набор: Huber(ab) + Gradient(ab).** Huber надёжно задаёт глобальную точность chroma и единственный чаще предпочитает semantic-wrong plausible-варианту (61.0%). Gradient — самый прямой и дешёвый сигнал для bleeding; его sensitivity к bleeding в 5.7 раза выше Huber по доле профиля.</p>
+<p>2. **Первый perceptual-кандидат для абляции: LPIPS/VGG.** Он сильнее всех выделяет wrong_hue и почти не дублирует Gradient (cosine 0.0245). Но semantic win rate 40.9% не показывает семантического преимущества над pixel loss.</p>
+<p>3. **Spatial ConvNeXt — отдельная bleeding-абляция, не default.** По профилю он реагирует на bleeding почти как Gradient, но даёт почти ортогональный градиент. Его severity-кривые менее стабильны и semantic win rate всего 23.7%.</p>
+<p>4. **DINOv3 пока не добавлять в основной рецепт.** Сигнал направленно новый и монотонный, но здесь он не выигрывает ни semantic discrimination, ни bleeding у более дешёвых кандидатов. Одновременное добавление всех perceptual losses усложнит калибровку без подтверждённой пользы.</p>
+<p>Практический порядок ablation: Huber; Huber+Gradient; Huber+Gradient+LPIPS; затем заменить LPIPS на spatial ConvNeXt. Сравнивать при выровненных RMS вкладов градиента и одинаковом compute budget. Финальный выбор делать по held-out colorization quality: эта диагностика измеряет реакцию на сконструированные ошибки, а не качество обученной модели.</p>
+<h2>Исправления и ограничения</h2>
+<p>- ConvNeXt: ImageNet mean/std checkpoint, spatial MSE по четырём стадиям.</p>
+<p>- DINO: patch tokens блоков 3/6/9/12 без CLS и registers.</p>
+<p>- Huber/Gradient считаются непосредственно по ab; perceptual losses — через дифференцируемое Lab→RGB при фиксированном L.</p>
+<p>- Gamut projection выполняется до интерполяции; RGB clipping не меняет L.</p>
+<p>- Semantic/plausible сопоставлены внутри исходника по средней величине ab; добавлены парные результаты, интервалы и within-image monotonicity.</p>
+<p>- Sensitivity shares сохранены как описательные доли; рейтинг разных loss по ним удалён.</p>
+<p>- Сохранены версии моделей, библиотек и хеши расчётного кода.</p>
+<p>**Поправка к фидбеку:** официальный pMF действительно использует global average pooling и расстояние между итоговыми векторами. Его preprocessing отличается от HF processor. Новый spatial ConvNeXt — отдельный кандидат для локальных ошибок, не точная копия pMF. [pMF ConvNeXt](https://github.com/Lyy-iiis/pMF/blob/main/models/convnext.py), [pMF auxiliary loss](https://github.com/Lyy-iiis/pMF/blob/main/utils/auxloss_util.py), [HF processor](https://huggingface.co/facebook/convnextv2-base-22k-224/blob/main/preprocessor_config.json).</p>
+<p>В диагностике используется full-image resize 224, в тренировочном модуле сохраняются paired random crops. Веса стадий, crops, веса общей смеси и качество обучения нужно проверять отдельными held-out абляциями. Старые коэффициенты ConvNeXt не следует считать откалиброванными для нового spatial loss.</p>
+<p>Протокол генерации и статус проверки меток записаны в `summary.json`. Численные данные: CSV рядом с этим отчётом. Конфигурация: `summary.json`.</p>

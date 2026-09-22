@@ -26,6 +26,14 @@ def normalized_lab_to_rgb(L: Tensor, ab: Tensor) -> Tensor:
     return lab_to_rgb(lab_physical, clip=False)
 
 
+def spatial_distance(predicted, target):
+    """Equal-weight mean MSE across corresponding spatial feature stages."""
+    if not predicted or len(predicted) != len(target):
+        raise ValueError("Corresponding nonempty feature stages are required")
+    return torch.stack([(pred.float() - ref.float()).square().flatten(1).mean(1)
+                        for pred, ref in zip(predicted, target)]).mean(0)
+
+
 def paired_random_resized_crop(x1: Tensor, x2: Tensor, out_size: int = 224,
                                scale: tuple[float, float] = (0.08, 1.0),
                                ratio: tuple[float, float] = (3 / 4, 4 / 3),
@@ -109,13 +117,15 @@ class PerceptualLosses:
         if self.convnext is None:
             convnext_values = zeros
         else:
-            # Faithful pMF behavior: its normalized training images are sent
-            # directly to the converted ConvNeXt feature extractor.
-            predicted_input = predicted_rgb * 2 - 1
-            target_input = target_rgb * 2 - 1
-            predicted_output = self.convnext(pixel_values=predicted_input)
-            target_output = self.convnext(pixel_values=target_input)
-            predicted_features = getattr(predicted_output, "pooler_output", predicted_output)
-            target_features = getattr(target_output, "pooler_output", target_output)
-            convnext_values = (predicted_features - target_features).float().pow(2).flatten(1).sum(1)
+            # HF checkpoint normalization; spatial stages, not pooled embeddings.
+            # This is a multiscale feature loss, not the exact pMF perceptual variant.
+            mean = predicted_rgb.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+            std = predicted_rgb.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            predicted_output = self.convnext(pixel_values=(predicted_rgb - mean) / std,
+                                             output_hidden_states=True)
+            with torch.no_grad():
+                target_output = self.convnext(pixel_values=(target_rgb - mean) / std,
+                                              output_hidden_states=True)
+            convnext_values = spatial_distance(predicted_output.hidden_states[1:],
+                                                target_output.hidden_states[1:])
         return lpips_values, convnext_values
