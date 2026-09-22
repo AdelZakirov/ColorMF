@@ -109,11 +109,12 @@ class PMFColorizerModule(pl.LightningModule):
         edge_loss_enabled: bool = False,
         edge_loss_weight: float = 0.02,
         edge_boundary_boost: float = 4.0,
+        edge_tau: float = 0.1,
         edge_max_t: float = 1.0,
         sample_dir: str = "qualitative",
     ):
-        edge_loss_weight, edge_boundary_boost, edge_max_t = _validate_edge_loss_parameters(
-            edge_loss_weight, edge_boundary_boost, edge_max_t
+        edge_loss_weight, edge_boundary_boost, edge_tau, edge_max_t = _validate_edge_loss_parameters(
+            edge_loss_weight, edge_boundary_boost, edge_tau, edge_max_t
         )
         super().__init__()
         model_config = model or {}
@@ -178,6 +179,7 @@ class PMFColorizerModule(pl.LightningModule):
         self.edge_loss_enabled = bool(edge_loss_enabled)
         self.edge_loss_weight = edge_loss_weight
         self.edge_boundary_boost = edge_boundary_boost
+        self.edge_tau = edge_tau
         self.edge_max_t = edge_max_t
         self._perceptual_losses: Optional[PerceptualLosses] = None
         self._pending_ema_state: Optional[dict] = None
@@ -239,6 +241,7 @@ class PMFColorizerModule(pl.LightningModule):
             edge_loss_enabled=self.edge_loss_enabled,
             edge_loss_weight=self.edge_loss_weight,
             edge_boundary_boost=self.edge_boundary_boost,
+            edge_tau=self.edge_tau,
             edge_max_t=self.edge_max_t,
         )
         batch_size = batch["ab"].shape[0]
@@ -405,6 +408,7 @@ class PMFColorizerModule(pl.LightningModule):
             edge_loss_enabled=self.edge_loss_enabled,
             edge_loss_weight=self.edge_loss_weight,
             edge_boundary_boost=self.edge_boundary_boost,
+            edge_tau=self.edge_tau,
             edge_max_t=self.edge_max_t,
         )
         for index, image_id in enumerate(batch["image_id"]):
@@ -573,6 +577,7 @@ class PMFColorizerModule(pl.LightningModule):
             "edge_loss_enabled": "edge_loss_enabled",
             "edge_loss_weight": "edge_loss_weight",
             "edge_boundary_boost": "edge_boundary_boost",
+            "edge_tau": "edge_tau",
             "edge_max_t": "edge_max_t",
             "random_seed": "random_seed", "ema_decay": "ema_decay",
             "ema_type": "ema_type", "ema_half_lives_kimg": "ema_half_lives_kimg",

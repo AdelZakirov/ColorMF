@@ -48,6 +48,7 @@ training:
     enabled: false
     weight: 0.02
     boundary_boost: 4.0
+    tau: 0.1
     max_t: 1.0
   norm_p: 1.0
   norm_eps: 0.01

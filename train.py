@@ -5,9 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
-import subprocess
 import sys
-from pathlib import Path
 
 import mlflow
 import pytorch_lightning as pl
@@ -96,19 +94,6 @@ def configure_model_compile(module: PMFColorizerModule, training: dict) -> None:
     )
 
 
-def _git_value(*arguments: str, fallback: str = "unknown") -> str:
-    result = subprocess.run(
-        ["git", *arguments],
-        cwd=Path(__file__).resolve().parent,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return fallback
-    return result.stdout.strip() or fallback
-
-
 def _tag_value(value) -> str:
     if value is None:
         return "null"
@@ -128,10 +113,6 @@ def log_mlflow_metadata(logger, config: dict, module: PMFColorizerModule) -> Non
         "runtime/pytorch_version": torch.__version__,
         "runtime/lightning_version": pl.__version__,
         "runtime/hostname": platform.node(),
-        "source/git_commit": _git_value("rev-parse", "HEAD"),
-        "source/git_dirty": bool(
-            _git_value("status", "--porcelain", fallback="")
-        ),
         "model/parameter_report": module.model.parameter_report(),
         "data/train_manifest": data.get("train_manifest"),
         "data/val_manifest": data.get("val_manifest"),
@@ -208,6 +189,7 @@ def main():
         edge_loss_enabled=edge_loss.get("enabled", False),
         edge_loss_weight=edge_loss.get("weight", 0.02),
         edge_boundary_boost=edge_loss.get("boundary_boost", 4.0),
+        edge_tau=edge_loss.get("tau", 0.1),
         edge_max_t=edge_loss.get("max_t", 1.0),
         sample_dir=training.get("sample_dir", "qualitative"),
     )

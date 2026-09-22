@@ -8,6 +8,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 
 
 @dataclass
@@ -113,11 +114,13 @@ def _adaptive_values(values: Tensor, norm_p: float, norm_eps: float) -> Tensor:
 def _validate_edge_loss_parameters(
     edge_loss_weight: float,
     edge_boundary_boost: float,
+    edge_tau: float,
     edge_max_t: float,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     try:
         weight = float(edge_loss_weight)
         boundary_boost = float(edge_boundary_boost)
+        tau = float(edge_tau)
         max_t = float(edge_max_t)
     except (TypeError, ValueError) as error:
         raise ValueError("edge loss parameters must be finite numbers") from error
@@ -125,22 +128,42 @@ def _validate_edge_loss_parameters(
         raise ValueError("edge_loss_weight must be finite and non-negative")
     if not math.isfinite(boundary_boost) or boundary_boost < 0.0:
         raise ValueError("edge_boundary_boost must be finite and non-negative")
+    if not math.isfinite(tau) or tau <= 0.0:
+        raise ValueError("edge_tau must be finite and positive")
     if not math.isfinite(max_t) or not 0.0 <= max_t <= 1.0:
         raise ValueError("edge_max_t must be finite and within [0, 1]")
-    return weight, boundary_boost, max_t
+    return weight, boundary_boost, tau, max_t
+
+
+def _chroma_edge_map(ab: Tensor, tau: float) -> Tensor:
+    kernels = ab.new_tensor(
+        [
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        ]
+    ).unsqueeze(1) / 8.0
+    padded = F.pad(ab, (1, 1, 1, 1), mode="replicate")
+    dx = F.conv2d(padded, kernels[0:1].expand(2, -1, -1, -1), groups=2)
+    dy = F.conv2d(padded, kernels[1:2].expand(2, -1, -1, -1), groups=2)
+    magnitude = torch.sqrt(
+        dx.square().sum(dim=1, keepdim=True)
+        + dy.square().sum(dim=1, keepdim=True)
+        + torch.finfo(ab.dtype).eps
+    )
+    return magnitude / (magnitude + tau)
 
 
 def _chroma_edge_loss(
     predicted_clean_ab: Tensor,
     target_ab: Tensor,
-    L: Tensor,
     t: Tensor,
     *,
     enabled: bool,
     boundary_boost: float,
+    tau: float,
     max_t: float,
 ) -> tuple[Tensor, Tensor]:
-    """Return raw per-example boundary-weighted chroma gradient L1 values."""
+    """Return per-example weighted L1 distances between soft chroma edges."""
     zero_per_example = torch.zeros(
         predicted_clean_ab.shape[0],
         device=predicted_clean_ab.device,
@@ -158,20 +181,13 @@ def _chroma_edge_loss(
 
     predicted_ab = predicted_clean_ab[active_indices].float()
     target_ab = target_ab[active_indices].float()
-    L_for_edges = ((L[active_indices].detach().float() + 1.0) * 0.5).clamp(0.0, 1.0)
-
-    pred_dx = predicted_ab[..., :, 1:] - predicted_ab[..., :, :-1]
-    pred_dy = predicted_ab[..., 1:, :] - predicted_ab[..., :-1, :]
-    gt_dx = target_ab[..., :, 1:] - target_ab[..., :, :-1]
-    gt_dy = target_ab[..., 1:, :] - target_ab[..., :-1, :]
-    edge_x = torch.abs(L_for_edges[..., :, 1:] - L_for_edges[..., :, :-1])
-    edge_y = torch.abs(L_for_edges[..., 1:, :] - L_for_edges[..., :-1, :])
-    weight_x = (1.0 + boundary_boost * edge_x.clamp(0.0, 1.0)).detach()
-    weight_y = (1.0 + boundary_boost * edge_y.clamp(0.0, 1.0)).detach()
-
-    loss_x_per_example = (weight_x * torch.abs(pred_dx - gt_dx)).flatten(1).mean(1)
-    loss_y_per_example = (weight_y * torch.abs(pred_dy - gt_dy)).flatten(1).mean(1)
-    active_values = 0.5 * (loss_x_per_example + loss_y_per_example)
+    predicted_edges = _chroma_edge_map(predicted_ab, tau)
+    target_edges = _chroma_edge_map(target_ab, tau)
+    weights = (1.0 + boundary_boost * target_edges).detach()
+    active_values = (
+        (weights * torch.abs(predicted_edges - target_edges)).flatten(1).sum(1)
+        / weights.flatten(1).sum(1)
+    )
     per_example = zero_per_example.index_copy(0, active_indices, active_values)
     return active_values.mean(), per_example
 
@@ -265,14 +281,15 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
                    edge_loss_enabled: bool = False,
                    edge_loss_weight: float = 0.02,
                    edge_boundary_boost: float = 4.0,
+                   edge_tau: float = 0.1,
                    edge_max_t: float = 1.0) -> MeanFlowTerms:
     """Evaluate official pMF training math for stochastic chroma state only."""
     if x.ndim != 4 or x.shape[1] != 2:
         raise ValueError("x must be stochastic ab state [B,2,H,W]")
     if L.shape != (x.shape[0], 1, *x.shape[-2:]):
         raise ValueError("L must be fixed [B,1,H,W]")
-    edge_loss_weight, edge_boundary_boost, edge_max_t = _validate_edge_loss_parameters(
-        edge_loss_weight, edge_boundary_boost, edge_max_t
+    edge_loss_weight, edge_boundary_boost, edge_tau, edge_max_t = _validate_edge_loss_parameters(
+        edge_loss_weight, edge_boundary_boost, edge_tau, edge_max_t
     )
     if not math.isfinite(float(noise_scale)) or noise_scale <= 0:
         raise ValueError("noise_scale must be a finite positive number")
@@ -323,10 +340,10 @@ def meanflow_terms(model: Callable, x: Tensor, L: Tensor, *, noise: Optional[Ten
     chroma_edge_loss, chroma_edge_loss_per_example = _chroma_edge_loss(
         reconstructed_ab,
         x,
-        L,
         t,
         enabled=edge_loss_enabled,
         boundary_boost=edge_boundary_boost,
+        tau=edge_tau,
         max_t=edge_max_t,
     )
     lpips_examples = convnext_examples = zeros

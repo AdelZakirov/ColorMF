@@ -193,27 +193,43 @@ def test_perceptual_function_receives_only_samples_below_cutoff():
     assert torch.count_nonzero(terms.perceptual_convnext_loss) == 1
 
 
-def test_chroma_edge_loss_matches_boundary_weighted_gradient_l1():
-    predicted = torch.zeros(1, 2, 2, 3)
-    predicted[0, 0] = torch.tensor([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]])
+def test_chroma_edge_loss_ignores_chroma_direction_for_matching_boundaries():
+    predicted = torch.zeros(1, 2, 5, 5)
     target = torch.zeros_like(predicted)
-    luminance = torch.tensor([[[[-1.0, 1.0, -1.0], [-1.0, 1.0, -1.0]]]])
+    predicted[:, 0, :, 2:] = 1.0
+    target[:, 1, :, 2:] = 1.0
 
     loss, per_example = _chroma_edge_loss(
         predicted,
         target,
-        luminance,
         torch.tensor([0.5]),
         enabled=True,
         boundary_boost=4.0,
+        tau=0.1,
         max_t=0.5,
     )
 
-    # The a-channel has four unit x-gradients, each at weight 5. There
-    # are eight flattened x-gradient elements across both chroma channels;
-    # the y term is zero, so 0.5 * (20 / 8) = 1.25.
-    torch.testing.assert_close(loss, torch.tensor(1.25))
-    torch.testing.assert_close(per_example, torch.tensor([1.25]))
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+    torch.testing.assert_close(per_example, torch.tensor([0.0]))
+
+
+def test_chroma_edge_loss_penalizes_displaced_boundaries():
+    predicted = torch.zeros(1, 2, 5, 6)
+    target = torch.zeros_like(predicted)
+    predicted[:, 0, :, 3:] = 1.0
+    target[:, 0, :, 2:] = 1.0
+
+    loss, _ = _chroma_edge_loss(
+        predicted,
+        target,
+        torch.tensor([0.5]),
+        enabled=True,
+        boundary_boost=4.0,
+        tau=0.1,
+        max_t=0.5,
+    )
+
+    assert loss > 0
 
 
 def test_chroma_edge_loss_cutoff_is_inclusive_and_inactive_values_are_zero():
@@ -226,15 +242,16 @@ def test_chroma_edge_loss_cutoff_is_inclusive_and_inactive_values_are_zero():
     loss, per_example = _chroma_edge_loss(
         predicted,
         target,
-        luminance,
         torch.tensor([0.5, 0.50001]),
         enabled=True,
         boundary_boost=0.0,
+        tau=0.1,
         max_t=0.5,
     )
 
-    torch.testing.assert_close(loss, torch.tensor(0.25))
-    torch.testing.assert_close(per_example, torch.tensor([0.25, 0.0]))
+    assert loss > 0
+    torch.testing.assert_close(per_example[0], loss)
+    torch.testing.assert_close(per_example[1], torch.tensor(0.0))
 
 
 def test_chroma_edge_loss_is_u_only_and_total_uses_raw_weight():
@@ -301,6 +318,8 @@ def test_disabled_chroma_edge_loss_preserves_existing_objective():
         ("edge_loss_weight", -0.1),
         ("edge_boundary_boost", float("inf")),
         ("edge_boundary_boost", -1.0),
+        ("edge_tau", 0.0),
+        ("edge_tau", float("nan")),
         ("edge_max_t", -0.1),
         ("edge_max_t", 1.1),
     ],
