@@ -59,6 +59,7 @@ training:
     convnext: {enabled: true, weight: 0.1}
   gradient_clip_val: 0.0
   checkpoint_dir: checkpoints/pmf_b_4_64
+  checkpoint_every_n_epochs: 1
   log_dir: logs
   logger: {type: mlflow, tracking_uri: sqlite:///./mlflow.db, artifact_location: file:./mlartifacts, experiment_name: ColorMF, run_name: pMF-B-4-64-colorization, log_model: false}
   sample_dir: qualitative/pmf_b_4_64

@@ -80,6 +80,15 @@ def logging_trainer_kwargs(training: dict) -> dict:
     return {"log_every_n_steps": log_every_n_steps}
 
 
+def checkpoint_callback_kwargs(training: dict) -> dict:
+    every_n_epochs = training.get("checkpoint_every_n_epochs", 1)
+    if isinstance(every_n_epochs, bool) or not isinstance(every_n_epochs, int):
+        raise ValueError("checkpoint_every_n_epochs must be a positive integer")
+    if every_n_epochs <= 0:
+        raise ValueError("checkpoint_every_n_epochs must be a positive integer")
+    return {"every_n_epochs": every_n_epochs}
+
+
 def configure_model_compile(module: PMFColorizerModule, training: dict) -> None:
     compile_mode = training.get("compile_mode")
     if compile_mode is None:
@@ -199,7 +208,7 @@ def main():
         dirpath=training.get("checkpoint_dir", "checkpoints"),
         filename="pmf-{epoch:04d}-{step:08d}",
         save_last=True,
-        every_n_epochs=1,
+        **checkpoint_callback_kwargs(training),
     )
     accelerator = training.get("accelerator", "auto")
     devices = training.get("devices", 1)

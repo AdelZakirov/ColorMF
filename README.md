@@ -103,6 +103,8 @@ python train.py --config configs/pmf_t_64_colorization.yaml
 
 The repository includes Tiny, Small, and pMF-B configurations. The B variants preserve the official 16×16 token geometry at 64, 128, and 256 pixels. Training supports Lightning DDP, BF16, Muon, EDM multi-EMA, MLflow logging, checkpoint resume, and optional LPIPS/ConvNeXt auxiliary losses.
 
+Set `training.checkpoint_every_n_epochs` in the YAML config to control how often epoch checkpoints are written (for example, `5` saves every five epochs). It defaults to `1`; `last.ckpt` is updated on the same interval.
+
 ## CelebA Evaluation
 
 `sample_celeba.py` reproduces the evaluation layout used above. It saves native 64×64 predictions and a second set where sampled `ab` is bicubically resized and combined with the original-size `L`:

@@ -49,7 +49,7 @@ training:
     enabled: true
     weight: 0.02
     boundary_boost: 4.0
-    tau: 0.1
+    tau: 0.02
     max_t: 1.0
   norm_p: 1.0
   norm_eps: 0.01
@@ -60,6 +60,7 @@ training:
     convnext: {enabled: false, weight: 0.0}
   gradient_clip_val: 0.0
   checkpoint_dir: checkpoints/pmf_b_16_256
+  checkpoint_every_n_epochs: 1
   log_dir: logs
   logger: {type: mlflow, tracking_uri: sqlite:///./mlflow.db, artifact_location: file:./mlartifacts, experiment_name: ColorMF, run_name: pMF-B-16-256-colorization, log_model: false}
   sample_dir: qualitative/pmf_b_16_256
