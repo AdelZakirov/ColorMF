@@ -1,0 +1,11 @@
+# Evaluation-only dependencies; training code/dependencies are unchanged.
+numpy>=2.0
+Pillow>=10.0
+opencv-python-headless>=4.10.0
+PyYAML>=6.0
+torch>=2.5
+torchvision>=0.20
+lpips==0.1.4
+pytorch-fid==0.3.0
+scikit-image>=0.25,<0.27
+scipy>=1.14

@@ -1,0 +1,18 @@
+# Paths are relative to this YAML file. Pass CLI paths to override them.
+predictions: ../celeba/64
+ground_truth: ../data/celeba_gt
+output: results/celeba64
+layout: sample-dirs
+sample_ids: [seed_1, seed_2, seed_3, seed_4, seed_5]
+metrics: [fid, lpips, psnr, ssim, colorfulness, delta_colorfulness, delta_e00]
+# Explicit resize applies to BOTH GT and predictions. No implicit resizing/crop.
+resize: [64, 64]
+# Match sample.prepare_input's resizing of the original GT for native outputs.
+resize_backend: opencv
+allow_subset: true
+allow_variable_k: false
+device: cpu
+batch_size: 32
+lpips_net: alex
+colorfulness_variant: absolute
+fid_sampling: first
