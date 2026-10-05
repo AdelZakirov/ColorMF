@@ -12,3 +12,4 @@ mlartifacts/
 mlruns/
 mlflow.db
 colorized.png
+eval/results/

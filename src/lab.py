@@ -55,9 +55,14 @@ def _as_uint8_lab(L: torch.Tensor, ab: torch.Tensor) -> np.ndarray:
 
     lab = torch.cat([L, ab], dim=1)
     lab = ((lab.float() + 1.0) * _LAB_SCALE).round().clamp(0.0, 255.0)
-    # ``torch==2.1`` in the legacy environment was built against NumPy 1.x.
-    # Going through a Python list keeps this utility usable with NumPy 2.x too.
-    lab = np.asarray(lab.detach().cpu().tolist(), dtype=np.uint8)
+    encoded = lab.detach().cpu().to(torch.uint8)
+    try:
+        lab = encoded.numpy()
+    except RuntimeError as error:
+        # Legacy torch==2.1 with NumPy 2 cannot expose a NumPy view.
+        if "Numpy is not available" not in str(error):
+            raise
+        lab = np.asarray(encoded.tolist(), dtype=np.uint8)
     return np.moveaxis(lab, 1, -1)
 
 

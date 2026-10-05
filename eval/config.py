@@ -23,6 +23,7 @@ class EvalConfig:
     allow_variable_k: bool = False
     device: str = "cpu"
     batch_size: int = 32
+    workers: int = 1
     lpips_net: str = "alex"
     colorfulness_variant: str = "absolute"
     fid_sampling: str = "first"
@@ -55,6 +56,8 @@ class EvalConfig:
             object.__setattr__(self, "sample_ids", tuple(self.sample_ids))
         if type(self.batch_size) is not int or self.batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
+        if type(self.workers) is not int or self.workers <= 0:
+            raise ValueError("workers must be a positive integer")
         for name in ("allow_subset", "allow_variable_k"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")

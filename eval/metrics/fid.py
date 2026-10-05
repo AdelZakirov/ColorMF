@@ -100,14 +100,26 @@ class FIDMetric:
             return image.shape
 
         statistics = FeatureStatistics()
+        pending, pending_count = [], 0
+        network = None
         for batch in shape_batches(images, self.batch_size, image_shape):
             inputs = torch.stack([rgb_tensor(image) for image in batch]).to(self.device)
+            if network is None:
+                network = self.network
             with torch.inference_mode():
-                features = self.network(inputs)[0]
-                if features.ndim != 4 or features.shape[:2] != (len(batch), self.dims):
+                features = network(inputs)[0]
+                if features.ndim != 4 or features.shape[:2] != (len(inputs), self.dims):
                     raise ValueError("FID backend must return N x D x H x W features")
                 features = torch.nn.functional.adaptive_avg_pool2d(features, (1, 1))
-            statistics.update(features.flatten(1).cpu().numpy())
+            pending.append(features.flatten(1).cpu().numpy())
+            pending_count += len(inputs)
+            # Covariance updates over feature blocks avoid a 2048x2048 outer
+            # product per image. Image features and their ordering are unchanged.
+            if pending_count >= 256:
+                statistics.update(np.concatenate(pending))
+                pending, pending_count = [], 0
+        if pending:
+            statistics.update(np.concatenate(pending))
         return statistics
 
     def protocol(self) -> dict:

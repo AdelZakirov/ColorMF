@@ -1,19 +1,131 @@
 # Saved-image evaluation
 
-Independent evaluation of saved colorizations. Everything lives in `eval/`;
-there are no imports of the training model, checkpoint loading, or generation.
+Independent evaluation of saved colorizations. The saved-image pipeline has no
+imports of the training model, checkpoint loading, or generation. An optional
+`eval.checkpoint` runner generates predictions before invoking that pipeline.
 Run commands from the repository root.
 
 ```bash
-venv/bin/python -m pip install -r eval/requirements.txt
+.venv/bin/python -m pip install -r eval/requirements.txt
 ```
 
+## Checkpoint generation and evaluation
+
+Install the repository's `requirements.txt` as well for checkpoint inference.
+The runner reads the architecture, noise scale, EMA choice, and data resize
+strategy from the checkpoint. For the supplied checkpoint:
+
+```bash
+OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 .venv/bin/python -m eval.checkpoint \
+  --checkpoint /mnt/WORKSPACE/aza_workspace/ColorMF/checkpoints/pmf_b_16_256/last.ckpt \
+  --ground-truth /mnt/IMAGING/HUB/DATASETS/general_datasets/imagenet/custom_val \
+  --output eval/results/pmf_b_16_256_cuda \
+  --sample-seeds 1 2 3 4 --device cuda \
+  --inference-batch-size 4 --batch-size 8
+```
+
+Choose a **new or empty** output directory for each generation run. Defaults are
+one sample (`seed_1`), automatic CUDA/CPU selection, float32, one warmup batch,
+and all seven metrics. `--inference-batch-size` bounds model sampling batches;
+`--batch-size` bounds metric batches. `--precision bfloat16` enables autocast.
+`--limit N` selects the first N relative image IDs in sorted order. Seeds are
+stable per relative image ID and independent of inference batch size, and their
+CLI order defines the first sample used for FID. FID requires at least two inputs.
+GPU kernels and mixed precision can introduce small rounding differences across
+batch layouts, even with identical seeds.
+
+The runner loads EMA weights when available (`--ema-variant 500` selects a
+variant); `--no-ema` selects raw weights. An unready EMA fails explicitly.
+`--model-config configs/pmf_b_256_colorization.yaml` overrides checkpoint model
+and noise settings or supplies missing hyperparameters; strict weight loading
+rejects architecture mismatches. Only load trusted PyTorch checkpoints.
+
+`--resize-strategy center_crop` uses the training dataset's ADM center crop;
+`--resize-strategy stretch` uses OpenCV cubic resize like `sample.prepare_input`.
+The checkpoint's recorded strategy is the default. Both inference luminance and
+evaluation GT come from the **same transformed RGB image**. GT is exported as
+lossless PNG, so evaluation needs no additional resize. EXIF/ICC decoding follows
+the evaluator's existing sRGB rules.
+
+The run directory contains `predictions/seed_N/<relative_id>.png`,
+`ground_truth/<relative_id>.png`, `generation.json`, and the four report files
+described below. `generation.json` records source paths, selection, checkpoint
+step, EMA, noise scale, precision, preprocessing, and sampling timing before
+metric evaluation. If a metric download fails, the saved outputs can be evaluated
+with `python -m eval` without regenerating predictions. For example:
+
+```bash
+.venv/bin/python -m eval \
+  --predictions eval/results/pmf_b_16_256_cuda/predictions \
+  --ground-truth eval/results/pmf_b_16_256_cuda/ground_truth \
+  --layout sample-dirs --sample-ids seed_1 seed_2 seed_3 seed_4 \
+  --device cuda --output eval/results/pmf_b_16_256_rescored
+```
+
+Checkpoint reports fill `timing.inference` with NFE per prediction, total measured
+sampling time, amortized latency per prediction, and predictions per second.
+Warmup, checkpoint loading, input decoding/device transfer, PNG encoding, and
+metric time are excluded; CUDA timing synchronizes before/after `model.sample`.
+This is sampling throughput for the recorded batch size, not full application
+latency. Saved-image-only runs continue to report inference as unmeasured.
+
 ## Quick start
+
+### Full-image colorization at original resolution
+
+```bash
+.venv/bin/python -m eval.original_size \
+  --checkpoint /path/to/last.ckpt --input /path/to/original_images \
+  --output /path/to/original_size_predictions --limit 100 \
+  --seed 1 --device cuda --batch-size 4 --ema-variant 500
+```
+
+This extracts OpenCV LAB L from the original RGB image, resizes **L alone** to
+the checkpoint's resolution with OpenCV cubic interpolation, then normalizes
+the resized L as `L_byte / 127.5 - 1`. Predicted normalized ab is bicubically
+resized back to each original image's dimensions (`align_corners=False`) and
+combined with its untouched original normalized L. Only the final LAB-to-RGB
+conversion rounds/clips to 8-bit. The output keeps the complete image at its
+original spatial resolution, with no crop. PNG filenames preserve relative image
+IDs. `generation.json` records the pipeline and each source/output size.
+`--workers 4` overlaps CPU decoding and PNG export within each model batch;
+it preserves sampling order and batch size. Outputs are saved atomically.
+`generation.jsonl` records completed batches during generation, and
+`generation_pending.json` records the settings until the final manifest is ready.
+To extend an earlier first-1,000 run, use `--offset 1000 --limit 4000` with
+a new output directory. The offset skips sorted image IDs before the limit;
+sampling seeds remain tied to each image ID.
+`--alpha 1.3` scales both continuous predicted normalized LAB chroma channels
+(`a` and `b`) by 1.3 before resizing them and converting LAB to RGB; the
+default `--alpha 1.0` preserves the original behavior.
+
+To score these outputs, use `python -m eval` against the original GT directory,
+without `--resize`, and use `--allow-subset` if only the first 100 were generated.
+RGB conversion can change reconstructed luminance for out-of-gamut colors.
+
+For a long full-ImageNet run, first copy `last.ckpt` to a stable checkpoint file:
+training can update that pathname. The Val50k run on 2026-10-05 uses a pinned
+epoch-239, step-1,050,000 checkpoint (EMA 500, seed 1, float32, batch 4), with
+all 50,000 predictions regenerated because the previous Val5k used epoch 234.
+Its original-size PNGs are in
+`/mnt/IMAGING/HUB/DATASETS/general_datasets/imagenet/imagenet1k/source/val_set_full_cmf/original_size_50000/`.
+Reports and the source decoding audit are in `eval/results/imagenet_val_original_size_50000/`.
+The full dataset requires no `--allow-subset` and no external `--resize`.
+The paired first-Val5k chroma-scale comparison reuses those epoch-239 alpha=1
+predictions and generates alpha=1.3 with the same checkpoint, seed, and images.
+Alpha scales physical CIELAB a*/b* around zero, accounting for the offset in
+the model normalization. Run `.venv/bin/python -m eval.run_alpha_sweep`;
+outputs and the metrics table are written under the shared Val output folder.
+A local copy of both metric reports and the comparison is retained in
+`eval/results/imagenet_val5k_alpha/`. The alpha=1 baseline is rechecked against
+a fresh eight-image CUDA generation before the full run.
+
+### Evaluate saved RGB predictions
 
 One prediction per image:
 
 ```bash
-venv/bin/python -m eval \
+.venv/bin/python -m eval \
   --predictions /path/to/predictions \
   --ground-truth /path/to/ground_truth \
   --output eval/results/run_1
@@ -25,7 +137,7 @@ use into the standard Torch cache. They never load a ColorMF checkpoint. For a
 run without any neural network loading/downloads, select only analytic metrics:
 
 ```bash
-venv/bin/python -m eval \
+.venv/bin/python -m eval \
   --predictions /path/to/predictions \
   --ground-truth /path/to/ground_truth \
   --metrics psnr ssim colorfulness delta_colorfulness delta_e00 \
@@ -35,7 +147,7 @@ venv/bin/python -m eval \
 The example YAML covers `sample_celeba.py`'s seed directories:
 
 ```bash
-venv/bin/python -m eval --config eval/config.example.yaml \
+.venv/bin/python -m eval --config eval/config.example.yaml \
   --predictions /path/to/celeba/64 \
   --ground-truth /path/to/celeba/images
 ```
@@ -45,6 +157,8 @@ CLI path overrides resolve relative to the current working directory. All CLI
 options override corresponding YAML values. Boolean flags support both forms,
 e.g. `--allow-subset` / `--no-allow-subset`. `--device cuda:0` changes the metric
 network device; CPU is the default. `--batch-size` bounds neural metric batches.
+`--workers 8` runs the per-image CPU metrics concurrently with bounded memory,
+preserving input order and macro aggregation; the default is one worker.
 LPIPS batches span consecutive inputs of the same size, including K=1, and
 include both GT comparisons and diversity pairs without changing their order.
 
@@ -83,8 +197,12 @@ permits unequal K with a report warning; it also relaxes equal seed coverage.
 
 Inputs must be saved 8-bit RGB or grayscale images. Grayscale is replicated
 into RGB. EXIF orientation is applied; valid embedded ICC profiles are converted
-to sRGB, and untagged files are assumed sRGB. Transparent images require explicit
-compositing before evaluation. High-bit-depth, floating-point, CMYK and
+to sRGB, and untagged RGB files are assumed sRGB. Unreadable/unusable ICC profiles and CMYK
+profiles attached to RGB pixels produce a warning; their decoded RGB pixels are
+preserved and assumed sRGB. CMYK pixels with a usable profile are converted
+to sRGB; untagged CMYK JPEGs use Pillow's default CMYK-to-RGB mapping and emit
+a warning. Transparent images require explicit compositing before evaluation.
+High-bit-depth, floating-point and
 multi-frame/animated files are rejected rather than silently quantized.
 
 The common representation is **HWC float32 sRGB [0,1]**. This is gamma-encoded
@@ -116,7 +234,7 @@ protocol. The common ICC/EXIF decoding rules above apply to both resize backends
 | `delta_colorfulness` | Absolute per-image `CF(pred) - CF(GT)`; signed difference also emitted | Lower absolute difference |
 | `delta_e00` | sRGB → physical CIELAB D65, 2° observer; scikit-image CIEDE2000 with kL=kC=kH=1, then mean over all pixels | Lower |
 
-SSIM requires at least 11×11. This protocol requires at least 64×64 for AlexNet
+SSIM requires at least 11×11. This protocol requires at least 31×31 for AlexNet
 LPIPS and 32×32 for VGG/Squeeze LPIPS, with no hidden upscaling. ΔE00 includes
 lightness error from the saved RGB; it does not overwrite prediction L with GT L.
 
@@ -210,31 +328,34 @@ save_report(report, config.output)
 ```
 
 `evaluate_records(iterable_of_ImageRecord, config)` separates evaluation from
-record discovery. A future inference runner can generate/save predictions and
-pass `ImageRecord` / `SampleRecord` instances directly without changing metrics
+record discovery. The checkpoint runner generates/saves predictions and
+passes `ImageRecord` / `SampleRecord` instances directly without changing metrics
 or aggregation. Such records must already be selected/ordered; directory-related
 config options apply in `discover()`. `progress(done, total)` is an optional API
 callback after each paired-image evaluation.
 
 `timing.evaluation_seconds` measures evaluation (including metric initialization
 and FID extraction, excluding discovery/report writing). `timing.inference`
-currently contains `status: not_measured` and null NFE, latency, throughput.
-Future inference measurements belong to that separate block and must come from
-an inference runner with warmup/device synchronization and a defined workload;
+for saved-image-only evaluation contains `status: not_measured` and null NFE,
+latency, throughput.
+Checkpoint measurements populate that separate block with warmup, device
+synchronization, and a recorded workload;
 disk decoding/metric runtime must not masquerade as model latency.
 
 ## Offline tests and reproducible technical smoke report
 
 ```bash
-venv/bin/python -m pytest -q eval/tests
-venv/bin/python -m eval.tests.smoke --output eval/results/smoke
+.venv/bin/python -m pytest -q eval/tests
+.venv/bin/python -m eval.tests.smoke --output eval/results/smoke
 ```
 
 Tests cover identities, known PSNR/LAB/ΔE00 references, Colorfulness conventions,
 normalization, shape/range failures, streaming covariance/parity with the FID
 reference, directory pairing/coverage, multi-sample aggregation, best-of-K
 selection, native ColorMF resize parity, LPIPS batching across inputs and sizes,
-CLI/YAML overrides, and JSON/CSV serialization. The smoke command
+CLI/YAML overrides, JSON/CSV serialization, checkpoint raw/EMA loading, preserved
+RoPE buffers, sampling parity, crop parity with training, seed/batch independence,
+and checkpoint CLI output reuse. The smoke command
 creates four 64×64 mock GT images and two samples per image, then runs every
 metric path with deterministic substitute LPIPS/Inception networks. Both the
 report and console mark these injected backends as **technical validation only**.

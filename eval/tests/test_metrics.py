@@ -78,7 +78,7 @@ class MetricTests(unittest.TestCase):
         np.testing.assert_allclose(network.last_first, 0)
         self.assertFalse(network.training)
         self.assertTrue(metric.protocol()["injected_network"])
-        with self.assertRaisesRegex(ValueError, "64x64"):
+        with self.assertRaisesRegex(ValueError, "31x31"):
             metric(self.white[:16, :16], self.black[:16, :16])
 
     def test_lpips_handles_variable_resolution(self):
@@ -93,6 +93,14 @@ class MetricTests(unittest.TestCase):
                 patch("pytorch_fid.inception.InceptionV3", side_effect=AssertionError("weight loading forbidden")):
             LPIPSMetric()
             FIDMetric()
+
+    def test_invalid_images_fail_before_loading_metric_weights(self):
+        with patch("lpips.LPIPS", side_effect=AssertionError("weight loading forbidden")), \
+                patch("pytorch_fid.inception.InceptionV3", side_effect=AssertionError("weight loading forbidden")):
+            with self.assertRaisesRegex(ValueError, "31x31"):
+                LPIPSMetric()(self.white[:30], self.black[:30])
+            with self.assertRaisesRegex(ValueError, "RGB values"):
+                FIDMetric().statistics([self.white * 2])
 
     def test_production_adapters_request_official_weights_and_protocol(self):
         network = MockDistance()
@@ -151,6 +159,15 @@ class MetricTests(unittest.TestCase):
         np.testing.assert_allclose(covariance, 0.25)
         np.testing.assert_allclose(network.last_inputs, 0.5)
         self.assertTrue(metric.protocol()["injected_network"])
+
+    def test_fid_feature_block_statistics_match_full_numpy_covariance(self):
+        values = np.random.default_rng(3).random((601, 3), dtype=np.float32)
+        metric = FIDMetric(network=MockFeatures(), dims=3, batch_size=7)
+        statistics = metric.statistics(value[None, None, :] for value in values)
+        mean, covariance = statistics.finalize()
+        self.assertEqual(statistics.count, len(values))
+        np.testing.assert_allclose(mean, values.astype(np.float64).mean(0), atol=1e-15)
+        np.testing.assert_allclose(covariance, np.cov(values.astype(np.float64), rowvar=False), atol=1e-15)
 
     def test_statistics_fail_on_insufficient_or_invalid_features(self):
         statistics = FeatureStatistics()

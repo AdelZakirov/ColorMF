@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+import warnings
 
 import numpy as np
 from PIL import Image, ImageCms, ImageOps
@@ -113,7 +114,7 @@ def load_rgb(path: Path, resize: tuple[int, int] | None = None, *,
     with Image.open(path) as source:
         if getattr(source, "n_frames", 1) != 1:
             raise ValueError(f"animated/multi-frame images are unsupported: {path}")
-        if source.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+        if source.mode not in ("RGB", "RGBA", "L", "LA", "P", "CMYK"):
             raise ValueError(f"unsupported image mode {source.mode!r} in {path}; "
                              "export an 8-bit sRGB image explicitly")
         # Pillow can silently decode 16-bit RGB PNG/TIFF into 8-bit RGB mode.
@@ -134,16 +135,46 @@ def load_rgb(path: Path, resize: tuple[int, int] | None = None, *,
         profile = image.info.get("icc_profile")
         if profile:
             try:
-                if image.mode in ("P", "RGBA"):
+                try:
+                    input_profile = ImageCms.ImageCmsProfile(BytesIO(profile))
+                except (OSError, ValueError):
+                    warnings.warn(f"Ignoring unreadable ICC profile; decoded RGB assumed sRGB: {path}",
+                                  RuntimeWarning, stacklevel=2)
+                    input_profile = None
+                profile_space = input_profile.profile.xcolor_space.strip() if input_profile else None
+                # An RGB file sometimes retains a printing profile after export.
+                # A CMYK profile cannot describe its three decoded RGB channels;
+                # preserve those pixels under the same assumption as untagged RGB.
+                if input_profile is None:
                     image = image.convert("RGB")
-                elif image.mode == "LA":
-                    image = image.convert("L")
-                image = ImageCms.profileToProfile(
-                    image, ImageCms.ImageCmsProfile(BytesIO(profile)),
-                    ImageCms.createProfile("sRGB"), outputMode="RGB")
+                elif image.mode in ("RGB", "RGBA", "P") and profile_space == "CMYK":
+                    warnings.warn(f"Ignoring incompatible CMYK ICC profile on {image.mode} image; "
+                                  f"decoded RGB assumed sRGB: {path}", RuntimeWarning, stacklevel=2)
+                    image = image.convert("RGB")
+                else:
+                    # Some grayscale JPEGs carry RGB ICC profiles. Expand their L
+                    # samples to RGB before applying that profile; native GRAY
+                    # profiles must keep L input for the color-management transform.
+                    if (image.mode in ("P", "RGBA") or
+                            (image.mode in ("L", "LA") and profile_space == "RGB")):
+                        image = image.convert("RGB")
+                    elif image.mode == "LA":
+                        image = image.convert("L")
+                    try:
+                        transform = ImageCms.buildTransform(
+                            input_profile, ImageCms.createProfile("sRGB"), image.mode, "RGB")
+                    except ImageCms.PyCMSError:
+                        warnings.warn(f"Ignoring unusable ICC profile; decoded RGB assumed sRGB: {path}",
+                                      RuntimeWarning, stacklevel=2)
+                        image = image.convert("RGB")
+                    else:
+                        image = ImageCms.applyTransform(image, transform)
             except (OSError, ValueError, ImageCms.PyCMSError) as error:
                 raise ValueError(f"cannot convert ICC profile to sRGB: {path}") from error
         else:
+            if image.mode == "CMYK":
+                warnings.warn(f"Untagged CMYK converted with Pillow's default CMYK-to-RGB mapping: {path}",
+                              RuntimeWarning, stacklevel=2)
             image = image.convert("RGB")
         if resize is not None and image.size != (resize[1], resize[0]):
             if resize_backend == "opencv":

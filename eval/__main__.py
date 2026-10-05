@@ -28,6 +28,7 @@ def parse_config(argv: list[str] | None = None) -> EvalConfig:
     parser.add_argument("--allow-variable-k", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--device", help="Device for metric networks only; default cpu")
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--workers", type=int, help="CPU image-metric workers; default 1")
     parser.add_argument("--lpips-net", choices=("alex", "vgg", "squeeze"))
     parser.add_argument("--colorfulness-variant", choices=("absolute", "signed"))
     parser.add_argument("--fid-sampling", choices=("first", "all"))

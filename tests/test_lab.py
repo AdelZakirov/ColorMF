@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 import torch
+import cv2
 
 from src.lab import (
     compose_lab,
@@ -35,7 +36,15 @@ class LabTests(unittest.TestCase):
         ab = torch.randn(2, 2, 4, 4)
         self.assertTrue(torch.equal(compose_lab(L, ab)[:, :1], L))
 
+    def test_numpy_conversion_matches_legacy_byte_conversion(self):
+        generator = torch.Generator().manual_seed(8)
+        L = torch.randn(2, 1, 43, 29, generator=generator) * 2
+        ab = torch.randn(2, 2, 43, 29, generator=generator) * 2
+        encoded = ((torch.cat([L, ab], 1).float() + 1) * 127.5).round().clamp(0, 255)
+        legacy = np.moveaxis(np.asarray(encoded.tolist(), dtype=np.uint8), 1, -1)
+        expected = np.stack([cv2.cvtColor(image, cv2.COLOR_LAB2RGB) for image in legacy])
+        np.testing.assert_array_equal(lab_to_rgb(L, ab), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
-

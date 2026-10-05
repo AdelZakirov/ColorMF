@@ -1,12 +1,13 @@
-"""Evaluate records independently of their producer or future inference runner."""
+"""Evaluate records independently of their producer or checkpoint runner."""
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
-from itertools import combinations
+from itertools import combinations, islice
 from time import perf_counter
 
 import numpy as np
@@ -125,16 +126,44 @@ def _evaluate_lpips(records: list[ImageRecord], config: EvalConfig, metric: LPIP
             progress(index, len(records))
 
 
+def _image_results(records: list[ImageRecord], config: EvalConfig,
+                   before_image: Callable[[ImageRecord], None] | None = None):
+    def score(record):
+        if before_image:
+            before_image(record)
+        return _evaluate_image(record, config)
+
+    if config.workers == 1:
+        yield from map(score, records)
+        return
+    # Bound both decoded images and queued results even when an early image is slow.
+    items = iter(records)
+    with ThreadPoolExecutor(max_workers=config.workers) as pool:
+        pending = deque(pool.submit(score, record)
+                        for record in islice(items, config.workers * 2))
+        while pending:
+            yield pending.popleft().result()
+            record = next(items, None)
+            if record is not None:
+                pending.append(pool.submit(score, record))
+
+
 def evaluate_records(records: Iterable[ImageRecord], config: EvalConfig, *,
                      lpips_metric: LPIPSMetric | None = None,
                      fid_metric: FIDMetric | None = None,
                      coverage: dict | None = None,
-                     progress: Callable[[int, int], None] | None = None) -> dict:
-    """The future inference stage only needs to produce these disk records.
+                     progress: Callable[[int, int], None] | None = None,
+                     phase_progress: Callable[[str, int, int], None] | None = None,
+                     before_image: Callable[[ImageRecord], None] | None = None) -> dict:
+    """The inference stage only needs to produce these disk records.
 
-    Metric time is measured separately. NFE/inference latency/throughput remain
-    unmeasured until a generation runner explicitly supplies those measurements.
+    NFE/inference latency/throughput remain unmeasured unless a generation runner
+    explicitly supplies those measurements.
     Injected neural backends are marked in the report and are not paper scores.
+    A concurrent disk producer can supply before_image to wait for each record's
+    atomically saved predictions before CPU scoring. Neural stages follow CPU
+    scoring, when all predictions are available. The callback runs on workers.
+    Evaluation wall time then includes producer readiness waits.
     """
     started = perf_counter()
     records = list(records)
@@ -155,14 +184,20 @@ def evaluate_records(records: Iterable[ImageRecord], config: EvalConfig, *,
     if "fid" in config.metrics and fid_metric is None:
         fid_metric = FIDMetric(config.device, config.batch_size)
     sample_rows, image_rows = [], []
-    for index, record in enumerate(records, start=1):
-        image_row, samples = _evaluate_image(record, config)
+    for index, (image_row, samples) in enumerate(_image_results(records, config, before_image), start=1):
         image_rows.append(image_row)
         sample_rows.extend(samples)
         if progress and "lpips" not in config.metrics:
             progress(index, len(records))
+        if phase_progress:
+            phase_progress("image_metrics", index, len(records))
     if "lpips" in config.metrics:
-        _evaluate_lpips(records, config, lpips_metric, image_rows, sample_rows, progress)
+        def lpips_progress(done, total):
+            if progress:
+                progress(done, total)
+            if phase_progress:
+                phase_progress("lpips", done, total)
+        _evaluate_lpips(records, config, lpips_metric, image_rows, sample_rows, lpips_progress)
     aggregate = {scope: _means(row[scope] for row in image_rows)
                  for scope in ("mean_over_samples", "first_sample")}
     if "delta_colorfulness" in config.metrics:
@@ -182,10 +217,13 @@ def evaluate_records(records: Iterable[ImageRecord], config: EvalConfig, *,
         real_paths = [record.ground_truth for record in records]
         pred_paths = [sample.path for record in records for sample in
                       (record.samples[:1] if config.fid_sampling == "first" else record.samples)]
-        real = fid_metric.statistics(load_rgb(path, config.resize, resize_backend=config.resize_backend)
-                                     for path in real_paths)
-        generated = fid_metric.statistics(load_rgb(path, config.resize, resize_backend=config.resize_backend)
-                                          for path in pred_paths)
+        def fid_images(paths, phase):
+            for index, path in enumerate(paths, start=1):
+                yield load_rgb(path, config.resize, resize_backend=config.resize_backend)
+                if phase_progress:
+                    phase_progress(phase, index, len(paths))
+        real = fid_metric.statistics(fid_images(real_paths, "fid_real"))
+        generated = fid_metric.statistics(fid_images(pred_paths, "fid_generated"))
         fid_result = {"value": frechet_distance(real, generated),
                       "real_count": real.count, "generated_count": generated.count,
                       "sampling": config.fid_sampling}
@@ -211,7 +249,9 @@ def evaluate_records(records: Iterable[ImageRecord], config: EvalConfig, *,
         "coverage": coverage or {"evaluated_images": len(records), "predictions": sum(counts),
                                  "k_min": min(counts), "k_max": max(counts)},
         "protocol": {
-            "images": "EXIF-oriented 8-bit sRGB; embedded ICC converted, untagged assumed sRGB; HWC [0,1]",
+            "images": "EXIF-oriented 8-bit sRGB; compatible embedded ICC converted; "
+                      "untagged RGB, unreadable/unusable ICC and RGB with incompatible CMYK ICC assumed sRGB; "
+                      "untagged CMYK converted with Pillow's default mapping; HWC [0,1]",
             "resize": "none" if config.resize is None else
                       ("OpenCV INTER_CUBIC" if config.resize_backend == "opencv" else "Pillow bicubic")
                       + ", both sets, no crop; unchanged if already at target size",
@@ -231,6 +271,8 @@ def evaluate_records(records: Iterable[ImageRecord], config: EvalConfig, *,
         "aggregate": aggregate, "fid": fid_result, "per_image": image_rows,
         "per_sample": sample_rows, "warnings": messages,
         "timing": {"evaluation_seconds": perf_counter() - started,
+                   "evaluation_scope": "metric pipeline wall time" +
+                       (", including producer readiness waits" if before_image else ""),
                    "inference": {"status": "not_measured", "nfe": None,
                                  "latency_seconds": None, "throughput_images_per_second": None}},
     }

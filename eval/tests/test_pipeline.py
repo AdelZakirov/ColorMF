@@ -95,6 +95,24 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("TECHNICAL TEST", summary(report))
         self.assertTrue(report["protocol"]["injected_neural_backends"])
 
+    def test_parallel_image_metrics_match_serial_and_preserve_order(self):
+        self.stochastic_fixture(7)
+        config = replace(self.config, layout="sample-dirs", metrics=METRICS)
+        phases = []
+        ready = []
+        reports = [evaluate(replace(config, workers=workers),
+                            lpips_metric=LPIPSMetric(network=MockDistance(), batch_size=3),
+                            fid_metric=FIDMetric(network=MockFeatures(), dims=3, batch_size=3),
+                            phase_progress=lambda phase, done, total: phases.append((phase, done, total)),
+                            before_image=lambda record: ready.append(record.image_id))
+                   for workers in (1, 3)]
+        for key in ("aggregate", "per_image", "per_sample", "fid", "coverage"):
+            self.assertEqual(reports[0][key], reports[1][key])
+        self.assertEqual(sorted(ready), sorted([row["image_id"] for row in reports[0]["per_image"]] * 2))
+        for phase in ("image_metrics", "lpips", "fid_real", "fid_generated"):
+            self.assertEqual([(done, total) for name, done, total in phases if name == phase],
+                             [(i, 7) for i in range(1, 8)] * 2)
+
     def test_fid_first_selection_is_configurable_and_all_counts(self):
         self.stochastic_fixture()
         config = replace(self.config, layout="sample-dirs", metrics=("fid",),
@@ -337,6 +355,50 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "high-bit-depth PNG"):
             load_rgb(path)
 
+    def test_grayscale_with_rgb_icc_profile_is_expanded_before_conversion(self):
+        gray = np.arange(144, dtype=np.uint8).reshape(12, 12)
+        profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        filename = self.root / "gray_with_rgb_profile.png"
+        Image.fromarray(gray).save(filename, icc_profile=profile)
+        expected = np.repeat(gray[..., None], 3, axis=-1).astype(np.float32) / 255
+        np.testing.assert_array_equal(load_rgb(filename), expected)
+
+    def test_rgb_with_incompatible_cmyk_profile_preserves_decoded_pixels(self):
+        profile = bytearray(ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes())
+        profile[16:20] = b"CMYK"  # ICC header color space no longer matches the RGB pixels.
+        filename = self.root / "rgb_with_cmyk_profile.png"
+        pixels = np.random.default_rng(1).integers(0, 256, (12, 12, 3), dtype=np.uint8)
+        Image.fromarray(pixels).save(filename, icc_profile=bytes(profile))
+        with self.assertWarnsRegex(RuntimeWarning, "incompatible CMYK"):
+            actual = load_rgb(filename)
+        np.testing.assert_array_equal(actual, pixels.astype(np.float32) / 255)
+
+    def test_unreadable_icc_profile_warns_and_preserves_decoded_pixels(self):
+        filename = self.root / "invalid_profile.png"
+        Image.fromarray(self.image).save(filename, icc_profile=b"not an ICC profile")
+        with self.assertWarnsRegex(RuntimeWarning, "unreadable ICC"):
+            actual = load_rgb(filename)
+        np.testing.assert_array_equal(actual, self.image.astype(np.float32) / 255)
+
+    def test_parseable_but_unusable_icc_preserves_pixels(self):
+        profile = bytearray(ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes())
+        profile[128:132] = b"\0\0\0\0"  # Valid header, no transform tags.
+        filename = self.root / "unusable_profile.png"
+        Image.fromarray(self.image).save(filename, icc_profile=bytes(profile))
+        with self.assertWarnsRegex(RuntimeWarning, "unusable ICC"):
+            actual = load_rgb(filename)
+        np.testing.assert_array_equal(actual, self.image.astype(np.float32) / 255)
+
+    def test_untagged_cmyk_uses_explicit_pillow_mapping(self):
+        filename = self.root / "cmyk.jpg"
+        cmyk = np.random.default_rng(2).integers(0, 256, (12, 15, 4), dtype=np.uint8)
+        Image.fromarray(cmyk, mode="CMYK").save(filename)
+        with Image.open(filename) as image:
+            expected = np.asarray(image.convert("RGB"), dtype=np.float32) / 255
+        with self.assertWarnsRegex(RuntimeWarning, "Untagged CMYK"):
+            actual = load_rgb(filename)
+        np.testing.assert_array_equal(actual, expected)
+
     def test_fid_insufficient_data_fails_before_network_loading(self):
         self.pair()
         with patch("eval.pipeline.FIDMetric", side_effect=AssertionError("must not load")):
@@ -389,6 +451,8 @@ class PipelineTests(unittest.TestCase):
             replace(self.config, output=self.pred / "out")
         with self.assertRaisesRegex(ValueError, "positive"):
             replace(self.config, batch_size=0)
+        with self.assertRaisesRegex(ValueError, "workers"):
+            replace(self.config, workers=0)
         with self.assertRaisesRegex(ValueError, "positive"):
             replace(self.config, resize=(0, 64))
         with self.assertRaisesRegex(ValueError, "resize_backend"):

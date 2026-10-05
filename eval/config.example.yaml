@@ -13,6 +13,7 @@ allow_subset: true
 allow_variable_k: false
 device: cpu
 batch_size: 32
+workers: 1
 lpips_net: alex
 colorfulness_variant: absolute
 fid_sampling: first
