@@ -423,6 +423,15 @@ class PixelMeanFlowB(nn.Module):
         digest = hashlib.sha256(f"{image_id}|{seed}".encode()).digest()
         return int.from_bytes(digest[:8], "little") % (2**63 - 1)
 
+    def sample_from_noise(self, L: Tensor, noise: Tensor) -> Tensor:
+        """One-step sampling with autograd; noise already includes the prior scale."""
+        t = torch.ones(noise.shape[0], device=L.device, dtype=L.dtype)
+        r = torch.zeros_like(t)
+        u, _ = self(noise, L, r, t, return_velocity=False)
+        self.last_sample_nfe = 1
+        self.main_model_evaluations += 1
+        return noise - (t - r).reshape(-1, 1, 1, 1) * u
+
     @torch.no_grad()
     def sample(self, L: Tensor, *, seed: Optional[int] = None,
                seeds: Optional[Sequence[int]] = None,
@@ -453,12 +462,7 @@ class PixelMeanFlowB(nn.Module):
                 (1, 2, *self.resolution), generator=generator
             ))
         z_t = torch.cat(noise).to(device=L.device, dtype=L.dtype)
-        t = torch.ones(z_t.shape[0], device=L.device, dtype=L.dtype)
-        r = torch.zeros_like(t)
-        u, _ = self(z_t, L, r, t, return_velocity=False)
-        self.last_sample_nfe = 1
-        self.main_model_evaluations += 1
-        return z_t - (t - r).reshape(-1, 1, 1, 1) * u
+        return self.sample_from_noise(L, z_t)
 
     @torch.no_grad()
     def sample_lab(self, L: Tensor, **kwargs) -> Tensor:

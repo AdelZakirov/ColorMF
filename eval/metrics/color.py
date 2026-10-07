@@ -37,5 +37,10 @@ def to_lab(image: np.ndarray) -> np.ndarray:
 
 def delta_e00(prediction: np.ndarray, target: np.ndarray) -> float:
     validate_pair(prediction, target)
-    return float(deltaE_ciede2000(to_lab(prediction), to_lab(target),
+    return delta_e00_lab(to_lab(prediction), to_lab(target))
+
+
+def delta_e00_lab(prediction_lab: np.ndarray, target_lab: np.ndarray) -> float:
+    """CIELAB arrays already converted through to_lab; enables reuse of GT LAB."""
+    return float(deltaE_ciede2000(prediction_lab, target_lab,
                                 kL=1, kC=1, kH=1, channel_axis=-1).mean())

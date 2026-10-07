@@ -88,6 +88,7 @@ class PaletteDataset(Dataset):
         train: bool = False,
         horizontal_flip: bool = False,
         resize_strategy: str = "center_crop",
+        return_rgb: bool = False,
     ):
         if (paths is None) == (manifest is None):
             raise ValueError("provide exactly one of paths or manifest")
@@ -96,6 +97,7 @@ class PaletteDataset(Dataset):
         self.train = train
         self.horizontal_flip = horizontal_flip
         self.resize_strategy = resize_strategy
+        self.return_rgb = return_rgb
 
     def __len__(self) -> int:
         return len(self.items)
@@ -106,7 +108,8 @@ class PaletteDataset(Dataset):
         path = str(self.items[index])
         return Path(path).stem, path
 
-    def __getitem__(self, index: int) -> dict:
+    def load_rgb(self, index: int) -> tuple[str, np.ndarray]:
+        """Decode and apply shared geometry without the optional LAB conversion."""
         image_id, path = self._item(index)
         image = cv2.imread(path, cv2.IMREAD_COLOR)
         if image is None and isinstance(self.items, IndexedManifest):
@@ -128,8 +131,17 @@ class PaletteDataset(Dataset):
             raise ValueError("resize_strategy must be 'center_crop' or explicit legacy 'stretch'")
         if self.train and self.horizontal_flip and random.random() < 0.5:
             image = image[:, ::-1].copy()
+        return image_id, image
+
+    def __getitem__(self, index: int) -> dict:
+        image_id, image = self.load_rgb(index)
         L, ab = rgb_to_lab(image)
-        return {"ab": ab, "L": L, "image_id": image_id}
+        result = {"ab": ab, "L": L, "image_id": image_id}
+        if self.return_rgb:
+            # Original RGB after the exact same geometry, never a LAB round trip.
+            import torch
+            result["rgb"] = torch.from_numpy(image.transpose(2, 0, 1).copy()).float() / 255
+        return result
 
 
 def _paths_from_root(root: str) -> list:

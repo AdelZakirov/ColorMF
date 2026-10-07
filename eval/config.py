@@ -23,15 +23,20 @@ class EvalConfig:
     allow_variable_k: bool = False
     device: str = "cpu"
     batch_size: int = 32
-    workers: int = 1
+    workers: int = 4
     lpips_net: str = "alex"
     colorfulness_variant: str = "absolute"
     fid_sampling: str = "first"
     resize_backend: str = "pillow"
+    fid_real_stats: Path | None = None
 
     def __post_init__(self) -> None:
         for name in ("predictions", "ground_truth", "output"):
             object.__setattr__(self, name, Path(getattr(self, name)).expanduser().resolve())
+        if self.fid_real_stats is not None:
+            object.__setattr__(self, "fid_real_stats", Path(self.fid_real_stats).expanduser().resolve())
+            if self.fid_real_stats.suffix != ".npz":
+                raise ValueError("fid_real_stats must be an .npz file")
         if isinstance(self.metrics, str):
             raise ValueError("metrics must be a list of metric names")
         object.__setattr__(self, "metrics", tuple(self.metrics))

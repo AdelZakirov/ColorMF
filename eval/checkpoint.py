@@ -87,11 +87,16 @@ def load_model(checkpoint_path: Path, *, model_config: Path | None = None,
 
 def prepare_rgb(path: Path, resolution: tuple[int, int], strategy: str) -> np.ndarray:
     """Use the evaluator's decoder and the training/inference spatial transform."""
+    if strategy == "prepared":
+        rgb = np.rint(load_rgb(path) * 255).astype(np.uint8)
+        if rgb.shape[:2] != tuple(resolution):
+            raise ValueError(f"prepared GT {path} has size {rgb.shape[:2]}, but model needs {resolution}")
+        return rgb
     if strategy == "stretch":
         rgb = load_rgb(path, resolution, resize_backend="opencv")
         return np.rint(rgb * 255).astype(np.uint8)
     if strategy != "center_crop":
-        raise ValueError("resize_strategy must be center_crop or stretch")
+        raise ValueError("resize_strategy must be center_crop, stretch or prepared")
     from src.data import adm_center_crop
 
     if resolution[0] != resolution[1]:
@@ -126,8 +131,8 @@ def generate(checkpoint: Path, ground_truth: Path, output: Path, *,
     model, metadata = load_model(checkpoint, model_config=model_config,
                                  use_ema=use_ema, ema_variant=ema_variant)
     strategy = resize_strategy or metadata["resize_strategy"]
-    if strategy not in ("center_crop", "stretch"):
-        raise ValueError("resize_strategy must be center_crop or stretch")
+    if strategy not in ("center_crop", "stretch", "prepared"):
+        raise ValueError("resize_strategy must be center_crop, stretch or prepared")
     device = torch.device(device)
     model.to(device)
     metadata.update(device=str(device), precision=precision, resize_strategy=strategy,
@@ -141,9 +146,14 @@ def generate(checkpoint: Path, ground_truth: Path, output: Path, *,
                  f"{model.resolution}, {strategy}, {device}")
     records = []
     for key, source in selected:
-        target_path = output / "ground_truth" / f"{key}.png"
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(prepare_rgb(source, model.resolution, strategy)).save(target_path)
+        if strategy == "prepared":
+            # Validate before sampling, and keep the shared GT paths for FID cache reuse.
+            prepare_rgb(source, model.resolution, strategy)
+            target_path = source
+        else:
+            target_path = output / "ground_truth" / f"{key}.png"
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(prepare_rgb(source, model.resolution, strategy)).save(target_path)
         samples = tuple(SampleRecord(f"seed_{seed}", output / "predictions" /
                                     f"seed_{seed}" / f"{key}.png") for seed in sample_seeds)
         records.append(ImageRecord(key, target_path, samples))
@@ -193,6 +203,7 @@ def generate(checkpoint: Path, ground_truth: Path, output: Path, *,
         "model_calls": calls, "batch_size": batch_size, "warmup_batches": warmup,
         "scope": "model.sample only; synchronized CUDA; excludes loading, transfer, decoding, PNG writing, metrics; latency is amortized per prediction",
     }
+    output.mkdir(parents=True, exist_ok=True)
     (output / "generation.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return records, metadata
 
@@ -207,8 +218,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--inference-batch-size", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32, help="Metric batch size")
+    parser.add_argument("--workers", type=int, default=4, help="CPU metric/decode workers")
     parser.add_argument("--precision", choices=("float32", "bfloat16"), default="float32")
-    parser.add_argument("--resize-strategy", choices=("center_crop", "stretch"), help="Defaults to the checkpoint's data preprocessing")
+    parser.add_argument("--resize-strategy", choices=("center_crop", "stretch", "prepared"), help="Defaults to the checkpoint's data preprocessing; prepared uses shared GT without transforms/copying")
+    parser.add_argument("--fid-real-stats", type=Path, help="Reusable GT FID moments (.npz)")
     parser.add_argument("--no-ema", action="store_true")
     parser.add_argument("--ema-variant")
     parser.add_argument("--limit", type=int, help="First N relative image IDs in sorted order")
@@ -220,11 +233,14 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     try:
-        config = EvalConfig(args.output / "predictions", args.output / "ground_truth",
+        config = EvalConfig(args.output / "predictions", args.ground_truth if
+                            args.resize_strategy == "prepared" else args.output / "ground_truth",
                             output=args.output, metrics=tuple(args.metrics), layout="sample-dirs",
                             sample_ids=tuple(f"seed_{seed}" for seed in args.sample_seeds),
-                            device=device, batch_size=args.batch_size, lpips_net=args.lpips_net,
-                            fid_sampling=args.fid_sampling, colorfulness_variant=args.colorfulness_variant)
+                            device=device, batch_size=args.batch_size, workers=args.workers,
+                            lpips_net=args.lpips_net,
+                            fid_sampling=args.fid_sampling, colorfulness_variant=args.colorfulness_variant,
+                            fid_real_stats=args.fid_real_stats)
         # Fail before expensive generation if FID cannot run on this selection.
         if "fid" in args.metrics and min(len(_index(args.ground_truth)), args.limit or math.inf) < 2:
             raise ValueError("FID needs at least two ground-truth images")

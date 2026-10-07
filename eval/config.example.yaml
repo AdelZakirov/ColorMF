@@ -13,7 +13,9 @@ allow_subset: true
 allow_variable_k: false
 device: cpu
 batch_size: 32
-workers: 1
+workers: 4
+# Optional shared GT cache, specific to this exact subset and preprocessing.
+# fid_real_stats: results/celeba64_gt_fid.npz
 lpips_net: alex
 colorfulness_variant: absolute
 fid_sampling: first

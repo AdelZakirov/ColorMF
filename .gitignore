@@ -13,3 +13,7 @@ mlruns/
 mlflow.db
 colorized.png
 eval/results/
+
+# Local FD pilot caches/statistics/evaluator outputs.
+experiments/fd_inception/
+experiments/fd_inception_smoke/

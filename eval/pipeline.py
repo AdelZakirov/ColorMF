@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
-from itertools import combinations, islice
+from itertools import combinations
 from time import perf_counter
 
 import numpy as np
 
 from .config import EvalConfig
+from ._parallel import ordered_map
 from .data import ImageRecord, discover, load_rgb, validate_pair
-from .metrics.color import colorfulness, delta_e00
+from .metrics.color import colorfulness, delta_e00_lab, to_lab
+from .fid_cache import DECODER_PROTOCOL, cache_metadata, load_statistics, save_statistics
 from .metrics.fid import FIDMetric, frechet_distance
 from .metrics.lpips import LPIPSMetric
 from .metrics.pixel import psnr, ssim
@@ -59,6 +60,7 @@ def _evaluate_image(record: ImageRecord, config: EvalConfig) -> tuple[dict, list
     if "colorfulness" in config.metrics or "delta_colorfulness" in config.metrics:
         target_colorfulness = colorfulness(target, config.colorfulness_variant)
     sample_metrics = []
+    target_lab = to_lab(target) if "delta_e00" in config.metrics else None
     for prediction in predictions:
         values = {}
         if "psnr" in config.metrics:
@@ -73,7 +75,7 @@ def _evaluate_image(record: ImageRecord, config: EvalConfig) -> tuple[dict, list
                 values.update(delta_colorfulness=abs(cf - target_colorfulness),
                               signed_delta_colorfulness=cf - target_colorfulness)
         if "delta_e00" in config.metrics:
-            values["delta_e00"] = delta_e00(prediction, target)
+            values["delta_e00"] = delta_e00_lab(to_lab(prediction), target_lab)
         sample_metrics.append(values)
 
     k = len(predictions)
@@ -100,11 +102,11 @@ def _evaluate_image(record: ImageRecord, config: EvalConfig) -> tuple[dict, list
 def _evaluate_lpips(records: list[ImageRecord], config: EvalConfig, metric: LPIPSMetric,
                     image_rows: list[dict], sample_rows: list[dict],
                     progress: Callable[[int, int], None] | None = None) -> None:
-    # Stream a single ordered sequence across inputs, retaining only one input's
-    # K decoded predictions and a neural batch, rather than the entire dataset.
+    # Stream ordered pairs from bounded decoded-record prefetch, retaining only
+    # the queued records and a neural batch rather than the entire dataset.
     def pairs():
-        for record in records:
-            target, predictions = _load_record(record, config)
+        loaded = ordered_map(lambda record: _load_record(record, config), records, config.workers)
+        for target, predictions in loaded:
             yield from ((prediction, target) for prediction in predictions)
             yield from combinations(predictions, 2)
 
@@ -133,19 +135,7 @@ def _image_results(records: list[ImageRecord], config: EvalConfig,
             before_image(record)
         return _evaluate_image(record, config)
 
-    if config.workers == 1:
-        yield from map(score, records)
-        return
-    # Bound both decoded images and queued results even when an early image is slow.
-    items = iter(records)
-    with ThreadPoolExecutor(max_workers=config.workers) as pool:
-        pending = deque(pool.submit(score, record)
-                        for record in islice(items, config.workers * 2))
-        while pending:
-            yield pending.popleft().result()
-            record = next(items, None)
-            if record is not None:
-                pending.append(pool.submit(score, record))
+    yield from ordered_map(score, records, config.workers)
 
 
 def evaluate_records(records: Iterable[ImageRecord], config: EvalConfig, *,
@@ -183,6 +173,16 @@ def evaluate_records(records: Iterable[ImageRecord], config: EvalConfig, *,
         lpips_metric = LPIPSMetric(config.lpips_net, config.device, config.batch_size)
     if "fid" in config.metrics and fid_metric is None:
         fid_metric = FIDMetric(config.device, config.batch_size)
+    real, real_cache, real_metadata = None, None, None
+    if "fid" in config.metrics and config.fid_real_stats is not None:
+        if fid_metric.injected:
+            raise ValueError("GT FID disk caches require the production extractor, not an injected network")
+        real_metadata = cache_metadata(records, config, fid_metric)
+        if config.fid_real_stats.exists():
+            real, cache_status = load_statistics(config.fid_real_stats, real_metadata)
+            real_cache = {"path": str(config.fid_real_stats), "status": cache_status}
+            if phase_progress:
+                phase_progress("fid_real_cached", real.count, real.count)
     sample_rows, image_rows = [], []
     for index, (image_row, samples) in enumerate(_image_results(records, config, before_image), start=1):
         image_rows.append(image_row)
@@ -218,15 +218,25 @@ def evaluate_records(records: Iterable[ImageRecord], config: EvalConfig, *,
         pred_paths = [sample.path for record in records for sample in
                       (record.samples[:1] if config.fid_sampling == "first" else record.samples)]
         def fid_images(paths, phase):
-            for index, path in enumerate(paths, start=1):
-                yield load_rgb(path, config.resize, resize_backend=config.resize_backend)
+            images = ordered_map(lambda path: load_rgb(
+                path, config.resize, resize_backend=config.resize_backend), paths, config.workers)
+            for index, image in enumerate(images, start=1):
+                yield image
                 if phase_progress:
                     phase_progress(phase, index, len(paths))
-        real = fid_metric.statistics(fid_images(real_paths, "fid_real"))
+        if real is None:
+            real = fid_metric.statistics(fid_images(real_paths, "fid_real"))
+            if config.fid_real_stats is not None:
+                if real_metadata != cache_metadata(records, config, fid_metric):
+                    raise ValueError("GT files changed while computing FID statistics; cache was not saved")
+                save_statistics(config.fid_real_stats, real, real_metadata)
+                real_cache = {"path": str(config.fid_real_stats), "status": "computed"}
         generated = fid_metric.statistics(fid_images(pred_paths, "fid_generated"))
         fid_result = {"value": frechet_distance(real, generated),
                       "real_count": real.count, "generated_count": generated.count,
                       "sampling": config.fid_sampling}
+        if real_cache is not None:
+            fid_result["real_statistics_cache"] = real_cache
         if min(real.count, generated.count) <= fid_metric.dims:
             messages.append("FID sample count is <= feature dimension; covariance is rank-deficient. "
                             "This small-data score is not a reliable paper comparison.")
@@ -249,9 +259,7 @@ def evaluate_records(records: Iterable[ImageRecord], config: EvalConfig, *,
         "coverage": coverage or {"evaluated_images": len(records), "predictions": sum(counts),
                                  "k_min": min(counts), "k_max": max(counts)},
         "protocol": {
-            "images": "EXIF-oriented 8-bit sRGB; compatible embedded ICC converted; "
-                      "untagged RGB, unreadable/unusable ICC and RGB with incompatible CMYK ICC assumed sRGB; "
-                      "untagged CMYK converted with Pillow's default mapping; HWC [0,1]",
+            "images": DECODER_PROTOCOL,
             "resize": "none" if config.resize is None else
                       ("OpenCV INTER_CUBIC" if config.resize_backend == "opencv" else "Pillow bicubic")
                       + ", both sets, no crop; unchanged if already at target size",

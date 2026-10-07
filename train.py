@@ -22,8 +22,25 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/pilot.yaml")
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--init-from",
+        default=None,
+        help="checkpoint to load model weights from; optimizer, scheduler, "
+        "step counter and EMA start fresh",
+    )
+    parser.add_argument(
+        "--init-ema-variant",
+        default=None,
+        help="with --init-from, load this EMA variant (e.g. 1000) instead of "
+        "the raw training weights",
+    )
     parser.add_argument("--mlflow-run-id", default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.resume and args.init_from:
+        parser.error("--resume and --init-from are mutually exclusive")
+    if args.init_ema_variant and not args.init_from:
+        parser.error("--init-ema-variant requires --init-from")
+    return args
 
 
 def build_logger(config: dict, run_id: str | None = None):
@@ -202,6 +219,24 @@ def main():
         edge_max_t=edge_loss.get("max_t", 1.0),
         sample_dir=training.get("sample_dir", "qualitative"),
     )
+    if args.init_from:
+        saved = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        if args.init_ema_variant:
+            shadows = (saved.get("ema") or {}).get("shadows")
+            if not shadows or args.init_ema_variant not in shadows:
+                available = sorted(shadows) if shadows else []
+                raise ValueError(
+                    f"EMA variant {args.init_ema_variant!r} not in checkpoint; "
+                    f"available: {available}"
+                )
+            model_state = shadows[args.init_ema_variant]
+        else:
+            model_state = {
+                key.removeprefix("model."): value
+                for key, value in saved["state_dict"].items()
+                if key.startswith("model.")
+            }
+        module.model.load_state_dict(model_state)
     configure_model_compile(module, training)
     datamodule = PaletteDataModule(**data)
     checkpoint = ModelCheckpoint(

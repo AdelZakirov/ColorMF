@@ -28,7 +28,9 @@ def parse_config(argv: list[str] | None = None) -> EvalConfig:
     parser.add_argument("--allow-variable-k", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--device", help="Device for metric networks only; default cpu")
     parser.add_argument("--batch-size", type=int)
-    parser.add_argument("--workers", type=int, help="CPU image-metric workers; default 1")
+    parser.add_argument("--workers", type=int, help="CPU metric/decode workers; default 4")
+    parser.add_argument("--fid-real-stats", type=Path,
+                        help="GT FID cache: load and validate if present, otherwise compute and save")
     parser.add_argument("--lpips-net", choices=("alex", "vgg", "squeeze"))
     parser.add_argument("--colorfulness-variant", choices=("absolute", "signed"))
     parser.add_argument("--fid-sampling", choices=("first", "all"))
@@ -46,8 +48,8 @@ def parse_config(argv: list[str] | None = None) -> EvalConfig:
         unknown = set(values) - set(EvalConfig.__dataclass_fields__)
         if unknown:
             raise ValueError(f"unknown config keys: {sorted(unknown)}")
-        for key in ("predictions", "ground_truth", "output"):
-            if key in values:
+        for key in ("predictions", "ground_truth", "output", "fid_real_stats"):
+            if key in values and values[key] is not None:
                 values[key] = filename.resolve().parent / Path(values[key]).expanduser()
     # Explicit CLI options override YAML; omitted flags preserve YAML values.
     values.update({key: value for key, value in args.items() if value is not None})

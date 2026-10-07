@@ -1,0 +1,37 @@
+seed: 42
+source:
+  checkpoint: /mnt/WORKSPACE/aza_workspace/ColorMF/checkpoints/pmf_b_16_256/last.ckpt
+  weights: ema
+  ema_variant: '500'
+data:
+  train_manifest: /mnt/IMAGING/HUB/DATASETS/general_datasets/imagenet/imagenet1k/imagenet1k_train_256_existing.txt
+  val_root: /mnt/IMAGING/HUB/DATASETS/general_datasets/imagenet/custom_val
+  resolution:
+  - 256
+  - 256
+  batch_size: 2
+  val_batch_size: 4
+  num_workers: 4
+  horizontal_flip: false
+  resize_strategy: center_crop
+fd:
+  stats_dir: experiments/fd_inception/stats
+  ema_beta: 0.999
+  generated_init_samples: 50000
+  stats_batch_size: 8
+  real_stats_batch_size: 32
+  stats_num_workers: 8
+training:
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  learning_rate: 1.0e-06
+  warmup_steps: 10
+  max_steps: 200
+  accumulate_grad_batches: 1
+  max_invalid_batches: 10
+  checkpoint_every_n_steps: 50
+  checkpoint_dir: checkpoints/fd_inception
+  log_dir: experiments/fd_inception/logs
+  logger:
+    type: csv

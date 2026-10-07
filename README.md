@@ -105,6 +105,13 @@ The repository includes Tiny, Small, and pMF-B configurations. The B variants pr
 
 Set `training.checkpoint_every_n_epochs` in the YAML config to control how often epoch checkpoints are written (for example, `5` saves every five epochs). It defaults to `1`; `last.ckpt` is updated on the same interval.
 
+For four-GPU Slurm training on the cluster, use
+[`slurm/submit_h200_4gpu.sh`](slurm/submit_h200_4gpu.sh). Before `srun`, it
+initializes the MLflow database and experiment once in the training container,
+using the same YAML config. This prevents concurrent database migrations when
+the database is new. New experiments store an absolute artifact path resolved
+from the project directory. Initialization errors stop the job before training.
+
 ## CelebA Evaluation
 
 `sample_celeba.py` reproduces the evaluation layout used above. It saves native 64×64 predictions and a second set where sampled `ab` is bicubically resized and combined with the original-size `L`:

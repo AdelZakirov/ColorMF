@@ -13,6 +13,32 @@ from ..data import validate_rgb
 from ._batching import rgb_tensor, shape_batches
 
 
+FID_EXTRACTOR = {
+    "implementation": "pytorch-fid", "dims": 2048,
+    "weights": "pt_inception-2015-12-05-6726825d.pth",
+    "internal_resize": "bilinear 299x299, align_corners=False",
+    "internal_normalization": "[0,1] to [-1,1]",
+}
+
+
+def create_fid_network(device="cpu") -> torch.nn.Module:
+    """Shared evaluator/training pool3 factory with the existing FID weights."""
+    from pytorch_fid.inception import InceptionV3
+    return InceptionV3(
+        [InceptionV3.BLOCK_INDEX_BY_DIM[2048]], resize_input=True,
+        normalize_input=True, requires_grad=False, use_fid_inception=True,
+    ).to(device).eval().requires_grad_(False)
+
+
+def extract_fid_features(network: torch.nn.Module, inputs: torch.Tensor,
+                         dims: int = 2048) -> torch.Tensor:
+    """N x D features; caller owns precision and grad/inference context."""
+    features = network(inputs)[0]
+    if features.ndim != 4 or features.shape[:2] != (len(inputs), dims):
+        raise ValueError("FID backend must return N x D x H x W features")
+    return torch.nn.functional.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
+
+
 @dataclass
 class FeatureStatistics:
     """Merge centered batch moments; covariance uses the unbiased N-1 divisor."""
@@ -87,10 +113,7 @@ class FIDMetric:
     @property
     def network(self) -> torch.nn.Module:
         if self._network is None:
-            from pytorch_fid.inception import InceptionV3
-            self._network = InceptionV3(
-                [InceptionV3.BLOCK_INDEX_BY_DIM[2048]], resize_input=True,
-                normalize_input=True, requires_grad=False, use_fid_inception=True)
+            self._network = create_fid_network(self.device)
         self._network.to(self.device).eval().requires_grad_(False)
         return self._network
 
@@ -107,10 +130,7 @@ class FIDMetric:
             if network is None:
                 network = self.network
             with torch.inference_mode():
-                features = network(inputs)[0]
-                if features.ndim != 4 or features.shape[:2] != (len(inputs), self.dims):
-                    raise ValueError("FID backend must return N x D x H x W features")
-                features = torch.nn.functional.adaptive_avg_pool2d(features, (1, 1))
+                features = extract_fid_features(network, inputs, self.dims)
             pending.append(features.flatten(1).cpu().numpy())
             pending_count += len(inputs)
             # Covariance updates over feature blocks avoid a 2048x2048 outer
@@ -123,7 +143,8 @@ class FIDMetric:
         return statistics
 
     def protocol(self) -> dict:
-        return {"implementation": "pytorch-fid", "dims": self.dims,
+        return {"extractor": None if self.injected else FID_EXTRACTOR,
+                "implementation": "pytorch-fid", "dims": self.dims,
                 "weights": "injected network" if self.injected else
                            "FID InceptionV3 (TensorFlow-compatible)",
                 "internal_resize": "backend-defined (injected)" if self.injected else

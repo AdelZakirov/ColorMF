@@ -9,6 +9,63 @@ Run commands from the repository root.
 .venv/bin/python -m pip install -r eval/requirements.txt
 ```
 
+## Fixed ImageNet val5k protocol
+
+Prepare once from the **original** validation images (flat or class subfolders):
+
+```bash
+OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 .venv/bin/python -m eval.imagenet_val5k prepare \
+  --source /mnt/IMAGING/HUB/DATASETS/general_datasets/imagenet/imagenet1k/source/val_set_full \
+  --dataset data/imagenet_val5k_256 --device cuda
+```
+
+Selection is exactly `ILSVRC2012_val_00000001` through `00005000`, ordered by
+validation filename, independent of class directories. Missing/duplicate selected
+filenames fail. Each decoded uint8 RGB image is cropped to its maximum central
+square (`side=min(H,W)`, top/left margins floored), then resized **once** to
+256×256 with `cv2.INTER_LINEAR`. No random augmentation or flip is used.
+Decoding uses the existing EXIF/ICC/sRGB rules documented below.
+
+The shared dataset contains:
+
+- `rgb/`: 5,000 lossless RGB PNG ground truths.
+- `manifest.json`: exact selection, crop coordinates, source/prepared SHA256,
+  preprocessing versions and per-image colorfulness (absolute and signed).
+- `gt_summary.json`: dataset mean colorfulness for both conventions.
+- `stats/fid_real_cuda_bs32.npz`: real Inception mean/scatter with validated
+  provenance, used to derive the unbiased covariance for FID.
+
+No separate L files are needed: inference derives L from the prepared RGB using
+`src.lab.rgb_to_lab` (OpenCV uint8 LAB, `L_byte/127.5-1`). That same prepared RGB
+is GT for metrics, without a LAB round trip or further resize. PSNR, SSIM, LPIPS,
+ΔE00 and FID distance require predictions; GT alone supplies FID moments and
+colorfulness. `--skip-fid` defers moment extraction until the first checkpoint run.
+Preparation can be rerun: an existing dataset is verified and reused.
+
+Run a **256×256 checkpoint**; the default computes all seven metrics:
+
+```bash
+OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 .venv/bin/python -m eval.imagenet_val5k run \
+  --checkpoint /path/to/last.ckpt --dataset data/imagenet_val5k_256 \
+  --output eval/results/imagenet_val5k_run1 --device cuda --ema-variant 500
+```
+
+The output contains predictions, `generation.json`, `report.json`, and the
+existing CSV reports. GT stays in the shared dataset, so checkpoint runs reuse
+the same files and cache. Dataset SHA256 checks reject changed/missing/extra GT
+images. Checkpoint training crop settings cannot override this protocol; a
+different model resolution fails. Sampling defaults to one seed (`1`), float32,
+one warmup batch and EMA when available. Existing checkpoint runner options
+`--model-config`, `--no-ema`, `--sample-seeds`, `--precision`,
+`--inference-batch-size`, `--batch-size`, `--workers`, and `--metrics` are supported.
+
+FID caches follow the evaluator's existing device-type/batch-size/version
+validation. A CPU preparation followed by a CUDA run computes
+`stats/fid_real_cuda_bs32.npz` once; subsequent CUDA runs reuse it. For a CUDA
+machine, prepare with `--device cuda` to create that cache immediately. Keep
+metric batch size consistent (default 32). Original-size, stretch256 and other
+subsets need their own caches.
+
 ## Checkpoint generation and evaluation
 
 Install the repository's `requirements.txt` as well for checkpoint inference.
@@ -46,6 +103,10 @@ The checkpoint's recorded strategy is the default. Both inference luminance and
 evaluation GT come from the **same transformed RGB image**. GT is exported as
 lossless PNG, so evaluation needs no additional resize. EXIF/ICC decoding follows
 the evaluator's existing sRGB rules.
+
+For already prepared GT, `--resize-strategy prepared` verifies the model's input
+size, applies no spatial transform and uses shared GT directly without copying it.
+`--fid-real-stats /path/to/cache.npz` reuses compatible real moments in that mode.
 
 The run directory contains `predictions/seed_N/<relative_id>.png`,
 `ground_truth/<relative_id>.png`, `generation.json`, and the four report files
@@ -157,10 +218,57 @@ CLI path overrides resolve relative to the current working directory. All CLI
 options override corresponding YAML values. Boolean flags support both forms,
 e.g. `--allow-subset` / `--no-allow-subset`. `--device cuda:0` changes the metric
 network device; CPU is the default. `--batch-size` bounds neural metric batches.
-`--workers 8` runs the per-image CPU metrics concurrently with bounded memory,
-preserving input order and macro aggregation; the default is one worker.
+`--workers 4` (the default) runs per-image CPU metrics and prefetches image
+decoding for LPIPS and FID. Each stage keeps at most `2 * workers` submitted
+records/images, plus the current neural batch. Input order, shape batching,
+and macro aggregation are preserved. `--workers 1` disables prefetch.
 LPIPS batches span consecutive inputs of the same size, including K=1, and
 include both GT comparisons and diversity pairs without changing their order.
+For K>1, GT CIELAB is computed once per input and reused for all delta-E00 scores.
+
+### Reuse GT FID statistics across checkpoints
+
+```bash
+OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=1 .venv/bin/python -m eval \
+  --predictions /path/to/checkpoint_predictions \
+  --ground-truth /path/to/shared_imagenet_val256 \
+  --output eval/results/checkpoint_eval --device cuda --batch-size 32 \
+  --fid-real-stats eval/results/cache/imagenet_val50k_crop256_gt.npz
+```
+
+`fid_real_stats` is also a YAML/Python `EvalConfig` option. If the file is missing,
+the evaluator computes GT moments once and saves them atomically. Subsequent runs
+load the moments and skip GT Inception extraction. The report records the path
+and whether the cache was computed or loaded. Predictions are always evaluated
+for the current run.
+
+Cache metadata validates the ordered GT IDs/paths, file sizes/modification times,
+decoder, external resize/backend, FID extractor, relevant package versions, neural
+batch size and CPU/CUDA device type. Changed inputs or settings fail before metric
+work; select a new cache path rather than silently replacing an incompatible cache.
+Stat signatures are not content hashes: deliberately preserving both file size
+and modification time after editing an input can evade this check. Only production
+FID extractors can use a disk cache.
+
+The archived original-resolution Val50k cache is supported through its matching
+companion `report.json` (which must stay beside the NPZ):
+
+```bash
+.venv/bin/python -m eval \
+  --predictions /path/to/original_size_predictions \
+  --ground-truth /mnt/IMAGING/HUB/DATASETS/general_datasets/imagenet/imagenet1k/source/val_set_full \
+  --output eval/results/new_original_size_run --device cuda --batch-size 8 \
+  --fid-real-stats eval/results/imagenet_val_original_size_50000/fid_real_statistics.npz
+```
+
+This legacy cache has no original file signatures, so reuse also requires that
+source file modification times do not postdate it. **Original-size, square-crop
+256x256, stretched 256x256, and Val5k are different GT distributions and need
+separate caches.** For already prepared 256x256 GT, point `--ground-truth` at that
+shared directory and leave `--resize` unset. A resize flag does not perform a crop.
+Checkpoint generation exports GT into a new run directory; to share this cache
+across runs, use saved predictions with `python -m eval` and one shared prepared
+GT directory rather than the per-run GT copies.
 
 ## Input layouts and pairing
 
